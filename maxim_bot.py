@@ -70,6 +70,8 @@ FILM_CUE_COUNT = int(os.getenv("FILM_CUE_COUNT", "3"))
 if FILM_CUE_COUNT not in (2, 3):
     raise RuntimeError("FILM_CUE_COUNT должно быть 2 или 3")
 BOT_AUTO_START = os.getenv("BOT_AUTO_START", "1").lower() not in {"0", "false", "no"}
+REPLY_FORCE_RESPOND = os.getenv("REPLY_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
+BOT_ID: int | None = None  # заполняется в main() через get_me()
 
 # Top собеседники Максима (из анализа)
 TOP_INTERLOCUTORS = {
@@ -192,8 +194,12 @@ class RateLimiter:
             self.daily_count = 0
             self.day_start = today
 
-    def can_respond(self, user_id: int) -> tuple[bool, str]:
-        """Проверяет, можно ли ответить. Возвращает (разрешено, причина)."""
+    def can_respond(self, user_id: int, *, skip_per_user: bool = False) -> tuple[bool, str]:
+        """Проверяет, можно ли ответить. Возвращает (разрешено, причина).
+
+        Когда skip_per_user=True (ответ на сообщение бота), персональный
+        кулдаун пропускается; глобальный кулдаун и дневной лимит остаются.
+        """
         self._reset_daily()
         now = time.time()
 
@@ -204,7 +210,7 @@ class RateLimiter:
             remaining = int(COOLDOWN_SECONDS - (now - self.last_response))
             return False, f"кулдаун ({remaining}с)"
 
-        if user_id in self.user_last_response:
+        if not skip_per_user and user_id in self.user_last_response:
             if now - self.user_last_response[user_id] < PER_USER_COOLDOWN:
                 remaining = int(PER_USER_COOLDOWN - (now - self.user_last_response[user_id]))
                 return False, f"персональный кулдаун ({remaining}с)"
@@ -453,15 +459,27 @@ async def _process_message(message: types.Message):
     context_messages = channel_context.get_recent(chat_id, 5)
     channel_context.add(chat_id, text, sender)
 
+    # Проверяем, ответил ли кто-то на сообщение бота
+    is_reply_to_bot = (
+        REPLY_FORCE_RESPOND
+        and message.reply_to_message is not None
+        and message.reply_to_message.from_user is not None
+        and message.reply_to_message.from_user.id == BOT_ID
+    )
+
     # Проверяем триггер
     trigger = detect_trigger(text, sender, user_id)
+    if is_reply_to_bot:
+        trigger.score = max(trigger.score, TRIGGER_THRESHOLD + 1)
+        trigger.will_respond = True
+        trigger.reasons.insert(0, "ответ на сообщение бота")
     logger.info(f"[TRIGGER] from={sender} score={trigger.score} respond={trigger.will_respond} reasons={trigger.reasons}")
 
     if not trigger.will_respond:
         return
 
-    # Проверяем rate limit
-    can_respond, reason = rate_limiter.can_respond(user_id)
+    # Проверяем rate limit (ответы на сообщения бота — без персонального кулдауна)
+    can_respond, reason = rate_limiter.can_respond(user_id, skip_per_user=is_reply_to_bot)
     if not can_respond:
         logger.info(f"[RATE-LIMIT] {reason} for {sender}")
         return
@@ -517,10 +535,14 @@ async def handle_group_message(message: types.Message):
 # ---------------------------------------------------------------------------
 
 async def main():
+    global BOT_ID
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN не задан!")
         return
     logger.info("🤖 Бот Максима Дементьева запускается...")
+    me = await bot.get_me()
+    BOT_ID = me.id
+    logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{me.username}")
     await dp.start_polling(bot)
 
 
