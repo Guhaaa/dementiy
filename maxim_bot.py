@@ -130,8 +130,8 @@ def detect_trigger(text: str, sender_name: str, sender_id: int) -> TriggerResult
         score += 15
         reasons.append("юмор")
 
-    # 4. Прямое обращение к Максиму (+30)
-    if re.search(r'(@максим|максим\b|макс\b)', text_lower):
+    # 4. Прямое обращение к Максиму/Дементию (+30)
+    if re.search(r'(@максим|@дементи(?:й|я|ю|ем|и)|максим\b|макс\b|дементи(?:й|я|ю|ем|и)\b)', text_lower):
         score += 30
         reasons.append("обращение")
 
