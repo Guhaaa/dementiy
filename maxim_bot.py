@@ -194,12 +194,8 @@ class RateLimiter:
             self.daily_count = 0
             self.day_start = today
 
-    def can_respond(self, user_id: int, *, skip_per_user: bool = False) -> tuple[bool, str]:
-        """Проверяет, можно ли ответить. Возвращает (разрешено, причина).
-
-        Когда skip_per_user=True (ответ на сообщение бота), персональный
-        кулдаун пропускается; глобальный кулдаун и дневной лимит остаются.
-        """
+    def can_respond(self, user_id: int) -> tuple[bool, str]:
+        """Проверяет, можно ли ответить. Возвращает (разрешено, причина)."""
         self._reset_daily()
         now = time.time()
 
@@ -210,7 +206,7 @@ class RateLimiter:
             remaining = int(COOLDOWN_SECONDS - (now - self.last_response))
             return False, f"кулдаун ({remaining}с)"
 
-        if not skip_per_user and user_id in self.user_last_response:
+        if user_id in self.user_last_response:
             if now - self.user_last_response[user_id] < PER_USER_COOLDOWN:
                 remaining = int(PER_USER_COOLDOWN - (now - self.user_last_response[user_id]))
                 return False, f"персональный кулдаун ({remaining}с)"
@@ -478,11 +474,12 @@ async def _process_message(message: types.Message):
     if not trigger.will_respond:
         return
 
-    # Проверяем rate limit (ответы на сообщения бота — без персонального кулдауна)
-    can_respond, reason = rate_limiter.can_respond(user_id, skip_per_user=is_reply_to_bot)
-    if not can_respond:
-        logger.info(f"[RATE-LIMIT] {reason} for {sender}")
-        return
+    # Для ответов на сообщения бота — полностью пропускаем rate limiter.
+    if not is_reply_to_bot:
+        can_respond, reason = rate_limiter.can_respond(user_id)
+        if not can_respond:
+            logger.info(f"[RATE-LIMIT] {reason} for {sender}")
+            return
 
     # Генерируем ответ
     try:
