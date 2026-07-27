@@ -71,7 +71,9 @@ if FILM_CUE_COUNT not in (2, 3):
     raise RuntimeError("FILM_CUE_COUNT должно быть 2 или 3")
 BOT_AUTO_START = os.getenv("BOT_AUTO_START", "1").lower() not in {"0", "false", "no"}
 REPLY_FORCE_RESPOND = os.getenv("REPLY_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
+MENTION_FORCE_RESPOND = os.getenv("MENTION_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
 BOT_ID: int | None = None  # заполняется в main() через get_me()
+BOT_USERNAME: str | None = None
 
 # Top собеседники Максима (из анализа)
 TOP_INTERLOCUTORS = {
@@ -462,20 +464,30 @@ async def _process_message(message: types.Message):
         and message.reply_to_message.from_user is not None
         and message.reply_to_message.from_user.id == BOT_ID
     )
+    # Проверяем, упомянули ли бота по @username
+    is_mentioned = (
+        MENTION_FORCE_RESPOND
+        and BOT_USERNAME is not None
+        and f"@{BOT_USERNAME}" in text
+    )
+    force_respond = is_reply_to_bot or is_mentioned
 
     # Проверяем триггер
     trigger = detect_trigger(text, sender, user_id)
-    if is_reply_to_bot:
+    if force_respond:
         trigger.score = max(trigger.score, TRIGGER_THRESHOLD + 1)
         trigger.will_respond = True
-        trigger.reasons.insert(0, "ответ на сообщение бота")
+        if is_mentioned:
+            trigger.reasons.insert(0, "упоминание бота")
+        if is_reply_to_bot:
+            trigger.reasons.insert(0, "ответ на сообщение бота")
     logger.info(f"[TRIGGER] from={sender} score={trigger.score} respond={trigger.will_respond} reasons={trigger.reasons}")
 
     if not trigger.will_respond:
         return
 
-    # Для ответов на сообщения бота — полностью пропускаем rate limiter.
-    if not is_reply_to_bot:
+    # reply и @упоминание — полностью пропускаем rate limiter.
+    if not force_respond:
         can_respond, reason = rate_limiter.can_respond(user_id)
         if not can_respond:
             logger.info(f"[RATE-LIMIT] {reason} for {sender}")
@@ -532,14 +544,15 @@ async def handle_group_message(message: types.Message):
 # ---------------------------------------------------------------------------
 
 async def main():
-    global BOT_ID
+    global BOT_ID, BOT_USERNAME
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN не задан!")
         return
     logger.info("🤖 Бот Максима Дементьева запускается...")
     me = await bot.get_me()
     BOT_ID = me.id
-    logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{me.username}")
+    BOT_USERNAME = me.username
+    logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{BOT_USERNAME}")
     await dp.start_polling(bot)
 
 
