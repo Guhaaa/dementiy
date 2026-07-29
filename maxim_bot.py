@@ -75,6 +75,30 @@ MENTION_FORCE_RESPOND = os.getenv("MENTION_FORCE_RESPOND", "1").lower() not in {
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
 
+# Паттерны явного prompt injection — логируются, ответ не генерируется
+_INJECTION_PATTERNS = [
+    re.compile(pat, re.IGNORECASE)
+    for pat in (
+        r"(?:ignore|забудь|отмени|игнорируй)\s+(?:all|все|вс[её]|previous|предыдущ|above|выше)",
+        r"(?:you are now|ты теперь|from now on|теперь ты)\s+(?!.*максим)",
+        r"<\|im_start\|>",
+        r"<\|im_end\|>",
+        r"\bsystem\s*:",
+        r"\[system\]",
+        r"\[SYSTEM\]",
+        r"(?:повтори|повторить|расскажи|покажи|напиши|скажи|опиши|what is|repeat|print|output|show)\s+(?:свой|свои|твой|твои|your|the|сво[йю])\s+(?:промпт|prompt|system|инструкци|instruction|настройк|setting|конфиг|config)",
+        r"(?:напиши|переведи|закодируй|encode|translate|decode)\s+(?:свой|твой)\s+(?:промпт|prompt)",
+        r"DAN\s*(?:mode|режим)",
+        r"(?:войди|включи|активируй|перейди)\s+(?:в\s+)?(?:режим|mode)\s+(?:разработчик|developer|отладк|debug|без\s+ограничен)",
+        r"(?:developer|разработчик|debug|отлад)\s*(?:mode|режим)",
+        r"(?:ты|you)\s+(?:are|—|–)\s*(?:нейросеть|нейрон|ии|ai|бот|bot|chatgpt|gpt|claude|deepseek)",
+        r"(?:какая|какой|какую|what|which)\s+(?:у тебя|твоя|твой|your|ты\s+(?:используешь|пользуешься|юзаешь)|do you use|are you using)\s+(?:модель|model|llm|нейросет)",
+        r"(?:модель|model|llm|нейросет)[ьюей]?\s+(?:у тебя|ты\s+(?:используешь|пользуешься|юзаешь)|do you use|are you using)",
+        r"(?:расскажи|опиши|скажи|опишите|расскажите)\s+(?:свой|свои|твой|твои)\s+(?:промпт|инструкци|system prompt)",
+        r"(?:what|which)\s+llm\s+(?:do you use|are you)",
+    )
+]
+
 # Top собеседники Максима (из анализа)
 TOP_INTERLOCUTORS = {
     "баталов", "хомутов", "бабаев", "коробейников",
@@ -381,6 +405,9 @@ bot_started = BOT_AUTO_START
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     global bot_started
+    if message.chat.type != "private":
+        await message.reply("Команды управления — только в личку.")
+        return
     bot_started = True
     await message.answer("🤖 Бот Максима запущен. Слушаю канал.")
 
@@ -388,19 +415,24 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     global bot_started
+    if message.chat.type != "private":
+        await message.reply("Команды управления — только в личку.")
+        return
     bot_started = False
     await message.answer("🔴 Бот Максима остановлен.")
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
+    if message.chat.type != "private":
+        await message.reply("Команды управления — только в личку.")
+        return
     try:
         await message.answer(
             f"📊 Статус:\n"
             f"Активен: {'да' if bot_started else 'нет'}\n"
             f"Ответов сегодня: {rate_limiter.daily_count}/{DAILY_LIMIT}\n"
             f"Контекст: {channel_context.total_size} сообщений\n"
-            f"Порог триггера: {TRIGGER_THRESHOLD}"
         )
     except Exception as e:
         logger.error(f"[STATUS ERROR] {e}")
@@ -409,6 +441,9 @@ async def cmd_status(message: types.Message):
 @dp.message(Command("debug"))
 async def cmd_debug(message: types.Message):
     """Показывает, сработал бы триггер на последнее сообщение."""
+    if message.chat.type != "private":
+        await message.reply("Команды управления — только в личку.")
+        return
     if channel_context.last_message is None:
         await message.answer("Нет сохранённых сообщений.")
         return
@@ -444,6 +479,15 @@ async def _process_message(message: types.Message):
     user_id = message.from_user.id if message.from_user else 0
     chat_type = message.chat.type
     chat_id = message.chat.id
+
+    # Детектор инъекций — логируем попытку и молча пропускаем
+    for pat in _INJECTION_PATTERNS:
+        if pat.search(text):
+            logger.warning(
+                "[SECURITY] Possible injection attempt from %s (user_id=%s): %r",
+                sender, user_id, text[:120],
+            )
+            return
 
     # Белый список каналов/групп (если задан)
     if CHANNEL_IDS and chat_id not in CHANNEL_IDS:
