@@ -8,10 +8,8 @@
 from __future__ import annotations
 
 import json
-import html
 import os
 import random
-import re
 import tempfile
 from datetime import datetime, timedelta
 
@@ -57,20 +55,6 @@ def clean_post(raw: str) -> str | None:
     if not text or text.upper().startswith("SKIP") or "http" not in text:
         return None
     return text
-
-
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
-
-
-def to_telegram_html(text: str) -> str:
-    """Пост → HTML для Telegram: markdown-ссылка [текст](url) становится <a>."""
-    parts, last = [], 0
-    for m in _MD_LINK_RE.finditer(text):
-        parts.append(html.escape(text[last:m.start()], quote=False))
-        parts.append(f'<a href="{html.escape(m.group(2))}">{html.escape(m.group(1), quote=False)}</a>')
-        last = m.end()
-    parts.append(html.escape(text[last:], quote=False))
-    return "".join(parts)
 
 
 class ProactiveState:

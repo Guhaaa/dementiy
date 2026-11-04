@@ -30,14 +30,14 @@ from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
-from maxim_proactive import (
-    ProactiveState, build_task, clean_post, next_post_time, to_telegram_html,
-)
+from maxim_format import md_to_telegram_html
+from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
 from maxim_sessions import SESSION_PREAMBLE, ChatSessions, build_turn, overrides_hash
 from maxim_style import build_hints, build_system_prompt, choose_film_cues, choose_phrase_cue
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram import F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -708,6 +708,20 @@ async def cmd_debug(message: types.Message):
     )
 
 
+async def send_formatted(chat_id: int, text: str, reply_to: types.Message | None = None):
+    """Markdown модели → HTML; если Telegram отверг разметку — тот же текст без неё."""
+    async def send(body: str, parse_mode: str | None):
+        if reply_to is not None:
+            return await reply_to.reply(body, parse_mode=parse_mode)
+        return await bot.send_message(chat_id, body, parse_mode=parse_mode)
+
+    try:
+        return await send(md_to_telegram_html(text), ParseMode.HTML)
+    except TelegramBadRequest as e:
+        logger.warning(f"[FORMAT] HTML отклонён ({e}), отправляю без разметки")
+        return await send(text, None)
+
+
 # Предложенные агентом поправки, ждут кнопки Максима: id → (kind, text, bot_text)
 pending_corrections: dict[int, tuple[str, str, str]] = {}
 _next_correction_id = 0
@@ -877,9 +891,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Отправляем
     try:
-        # Ответ LLM — обычный текст. Не даём угловым скобкам из C++/HTML
-        # превращаться в Telegram entities и ломать отправку.
-        await message.reply(response, parse_mode=None)
+        await send_formatted(chat_id, response, reply_to=message)
         rate_limiter.record_response(user_id, cooldown=not force_respond)
         if force_respond:
             rate_limiter.record_direct(chat_id)
@@ -932,7 +944,7 @@ async def _proactive_post(chat_id: int) -> None:
         logger.info(f"[PROACTIVE] chat_id={chat_id}: пропуск, нет поста")
         return
     try:
-        await bot.send_message(chat_id, to_telegram_html(post), parse_mode=ParseMode.HTML)
+        await send_formatted(chat_id, post)
     except Exception as e:
         logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
         return
