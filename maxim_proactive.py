@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import html
 import os
 import random
 import re
@@ -20,7 +21,7 @@ PROACTIVE_TASK = """Сейчас ты сам начинаешь разговор
 Учитывай, о чём недавно говорили в этом чате: не повторяй уже обсуждённое, а если находка продолжает недавний разговор — тем лучше.
 Найди через web search одну свежую (за последние 7 дней) и действительно интересную находку по темам Максима: LLM и агенты, Claude/Codex/Gemini, инструменты разработчика, C++/Python, компиляторы, Linux и мультимедиа, язык и перевод, наука. Выбирай то, что вызывает мысль или спор, а не пресс-релиз.
 Напиши сообщение в чат, как будто Максим сам делится находкой: 1–3 коротких предложения с его реакцией или мыслью, затем ссылка на источник отдельной строкой.
-Без заголовков, без markdown, без обращений вроде «Друзья» и без «Смотрите, что нашёл». Ссылка — обычный URL.
+Без заголовков и другого оформления, без обращений вроде «Друзья» и без «Смотрите, что нашёл». Ссылку дай в виде [короткое название](url).
 Если ничего стоящего не нашлось, верни ровно слово SKIP."""
 
 
@@ -55,8 +56,21 @@ def clean_post(raw: str) -> str | None:
     text = raw.strip()
     if not text or text.upper().startswith("SKIP") or "http" not in text:
         return None
-    # Telegram без parse_mode не рендерит markdown: [текст](url) → url
-    return re.sub(r"\[[^\]]*\]\((https?://[^)\s]+)\)", r"\1", text)
+    return text
+
+
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def to_telegram_html(text: str) -> str:
+    """Пост → HTML для Telegram: markdown-ссылка [текст](url) становится <a>."""
+    parts, last = [], 0
+    for m in _MD_LINK_RE.finditer(text):
+        parts.append(html.escape(text[last:m.start()], quote=False))
+        parts.append(f'<a href="{html.escape(m.group(2))}">{html.escape(m.group(1), quote=False)}</a>')
+        last = m.end()
+    parts.append(html.escape(text[last:], quote=False))
+    return "".join(parts)
 
 
 class ProactiveState:

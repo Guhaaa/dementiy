@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
+from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time, to_telegram_html
 
 TZ = ZoneInfo("Europe/Paris")
 
@@ -32,7 +32,14 @@ class PostTests(unittest.TestCase):
         self.assertIsNone(clean_post("SKIP"))
         self.assertIsNone(clean_post("Интересно, но без ссылки"))
         self.assertEqual(clean_post("  Т.е. теперь так.\nhttps://x.org  "), "Т.е. теперь так.\nhttps://x.org")
-        self.assertEqual(clean_post("Вот.\n[x 1.0](https://pypi.org/x/)"), "Вот.\nhttps://pypi.org/x/")
+        self.assertEqual(clean_post("Вот.\n[x 1.0](https://pypi.org/x/)"), "Вот.\n[x 1.0](https://pypi.org/x/)")
+
+    def test_markdown_link_becomes_html(self):
+        self.assertEqual(
+            to_telegram_html("a < b & c\n[x 1.0](https://pypi.org/x/?a=1&b=2)"),
+            'a &lt; b &amp; c\n<a href="https://pypi.org/x/?a=1&amp;b=2">x 1.0</a>',
+        )
+        self.assertEqual(to_telegram_html("https://x.org"), "https://x.org")
 
     def test_task_lists_recent_posts(self):
         self.assertIn("Не повторяй", build_task(["про Codex"]))

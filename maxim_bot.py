@@ -30,7 +30,9 @@ from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
-from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
+from maxim_proactive import (
+    ProactiveState, build_task, clean_post, next_post_time, to_telegram_html,
+)
 from maxim_sessions import SESSION_PREAMBLE, ChatSessions, build_turn, overrides_hash
 from maxim_style import build_hints, build_system_prompt, choose_film_cues, choose_phrase_cue
 
@@ -930,7 +932,7 @@ async def _proactive_post(chat_id: int) -> None:
         logger.info(f"[PROACTIVE] chat_id={chat_id}: пропуск, нет поста")
         return
     try:
-        await bot.send_message(chat_id, post, parse_mode=None)
+        await bot.send_message(chat_id, to_telegram_html(post), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
         return
