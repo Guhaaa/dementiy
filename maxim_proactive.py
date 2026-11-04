@@ -1,7 +1,8 @@
 """Сообщения бота первым: плавающее расписание и состояние.
 
-Состояние (DATA_DIR/proactive.json) переживает перезапуск: время следующего
-поста, группы, где бот видел сообщения, и последние посты (чтобы не повторяться).
+У каждой группы своё расписание. Состояние (DATA_DIR/proactive.json) переживает
+перезапуск: группы, где бот видел сообщения, время следующего поста в каждой
+и последние посты в каждой (чтобы не повторяться).
 """
 
 from __future__ import annotations
@@ -9,12 +10,14 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import tempfile
 from datetime import datetime, timedelta
 
 MAX_RECENT = 15
 
 PROACTIVE_TASK = """Сейчас ты сам начинаешь разговор в чате, никто тебя не спрашивал.
+Учитывай, о чём недавно говорили в этом чате: не повторяй уже обсуждённое, а если находка продолжает недавний разговор — тем лучше.
 Найди через web search одну свежую (за последние 7 дней) и действительно интересную находку по темам Максима: LLM и агенты, Claude/Codex/Gemini, инструменты разработчика, C++/Python, компиляторы, Linux и мультимедиа, язык и перевод, наука. Выбирай то, что вызывает мысль или спор, а не пресс-релиз.
 Напиши сообщение в чат, как будто Максим сам делится находкой: 1–3 коротких предложения с его реакцией или мыслью, затем ссылка на источник отдельной строкой.
 Без заголовков, без markdown, без обращений вроде «Друзья» и без «Смотрите, что нашёл». Ссылка — обычный URL.
@@ -44,7 +47,7 @@ def build_task(recent: list[str]) -> str:
     if not recent:
         return PROACTIVE_TASK
     shown = "\n".join(f"- {p[:200]}" for p in recent[-MAX_RECENT:])
-    return f"{PROACTIVE_TASK}\n\nНе повторяй темы своих прошлых сообщений:\n{shown}"
+    return f"{PROACTIVE_TASK}\n\nНе повторяй темы своих прошлых сообщений в этом чате:\n{shown}"
 
 
 def clean_post(raw: str) -> str | None:
@@ -52,24 +55,27 @@ def clean_post(raw: str) -> str | None:
     text = raw.strip()
     if not text or text.upper().startswith("SKIP") or "http" not in text:
         return None
-    return text
+    # Telegram без parse_mode не рендерит markdown: [текст](url) → url
+    return re.sub(r"\[[^\]]*\]\((https?://[^)\s]+)\)", r"\1", text)
 
 
 class ProactiveState:
     def __init__(self, path: str):
         self.path = path
-        self.next_at: datetime | None = None
         self.chats: set[int] = set()
-        self.recent: list[str] = []
+        self.next_at: dict[int, datetime] = {}
+        self.recent: dict[int, list[str]] = {}
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except FileNotFoundError:
             return
-        if data.get("next_at"):
-            self.next_at = datetime.fromisoformat(data["next_at"])
         self.chats = set(data.get("chats", []))
-        self.recent = list(data.get("recent", []))
+        # Старый формат (одно общее расписание) просто отбрасываем
+        if isinstance(data.get("next_at"), dict):
+            self.next_at = {int(k): datetime.fromisoformat(v) for k, v in data["next_at"].items()}
+        if isinstance(data.get("recent"), dict):
+            self.recent = {int(k): list(v) for k, v in data["recent"].items()}
 
     def save(self):
         directory = os.path.dirname(self.path) or "."
@@ -77,9 +83,9 @@ class ProactiveState:
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({
-                "next_at": self.next_at.isoformat() if self.next_at else None,
                 "chats": sorted(self.chats),
-                "recent": self.recent[-MAX_RECENT:],
+                "next_at": {str(k): v.isoformat() for k, v in self.next_at.items()},
+                "recent": {str(k): v[-MAX_RECENT:] for k, v in self.recent.items()},
             }, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
 
@@ -88,6 +94,10 @@ class ProactiveState:
             self.chats.add(chat_id)
             self.save()
 
-    def add_post(self, text: str):
-        self.recent = (self.recent + [text])[-MAX_RECENT:]
+    def set_next(self, chat_id: int, when: datetime):
+        self.next_at[chat_id] = when
+        self.save()
+
+    def add_post(self, chat_id: int, text: str):
+        self.recent[chat_id] = (self.recent.get(chat_id, []) + [text])[-MAX_RECENT:]
         self.save()

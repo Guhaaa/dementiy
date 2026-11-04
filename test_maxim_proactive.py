@@ -32,22 +32,32 @@ class PostTests(unittest.TestCase):
         self.assertIsNone(clean_post("SKIP"))
         self.assertIsNone(clean_post("Интересно, но без ссылки"))
         self.assertEqual(clean_post("  Т.е. теперь так.\nhttps://x.org  "), "Т.е. теперь так.\nhttps://x.org")
+        self.assertEqual(clean_post("Вот.\n[x 1.0](https://pypi.org/x/)"), "Вот.\nhttps://pypi.org/x/")
 
     def test_task_lists_recent_posts(self):
         self.assertIn("Не повторяй", build_task(["про Codex"]))
         self.assertNotIn("Не повторяй", build_task([]))
 
-    def test_state_survives_restart(self):
+    def test_state_per_chat_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "proactive.json")
             s = ProactiveState(path)
-            s.next_at = datetime(2026, 11, 5, 15, 0, tzinfo=TZ)
             s.remember_chat(-100123)
-            s.add_post("пост")
+            s.set_next(-100123, datetime(2026, 11, 5, 15, 0, tzinfo=TZ))
+            s.set_next(-100456, datetime(2026, 11, 6, 11, 0, tzinfo=TZ))
+            s.add_post(-100123, "пост")
             again = ProactiveState(path)
-            self.assertEqual(again.next_at, s.next_at)
             self.assertEqual(again.chats, {-100123})
-            self.assertEqual(again.recent, ["пост"])
+            self.assertEqual(again.next_at[-100456], datetime(2026, 11, 6, 11, 0, tzinfo=TZ))
+            self.assertEqual(again.recent, {-100123: ["пост"]})
+
+    def test_old_single_schedule_format_is_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "proactive.json")
+            with open(path, "w") as f:
+                f.write('{"next_at": "2026-11-05T21:55:00+01:00", "chats": [-1], "recent": []}')
+            s = ProactiveState(path)
+            self.assertEqual((s.chats, s.next_at, s.recent), ({-1}, {}, {}))
 
 
 if __name__ == "__main__":

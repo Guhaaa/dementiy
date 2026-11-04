@@ -12,7 +12,7 @@ import json
 import os
 import tempfile
 
-SESSION_PREAMBLE = """Это долгая сессия одного чата. Дальше в каждом ходе приходят новые сообщения чата с прошлого раза и последняя реплика, на которую нужно ответить. Свои прошлые ответы ты помнишь сам. На каждый ход верни только готовую реплику для чата или ровно SKIP."""
+SESSION_PREAMBLE = """Это долгая сессия одного чата. Дальше в каждом ходе приходят новые сообщения чата с прошлого раза и последняя реплика, на которую нужно ответить. Иногда вместо реплики приходит задача самому написать первым. Свои прошлые ответы ты помнишь сам. На каждый ход верни только готовую реплику для чата или ровно SKIP."""
 
 
 def overrides_hash(section: str) -> str:
@@ -21,17 +21,21 @@ def overrides_hash(section: str) -> str:
 
 def build_turn(
     new_messages: list[dict],
-    user_message: str,
+    user_message: str | None,
     hints: str = "",
     overrides_section: str = "",
+    task: str | None = None,
 ) -> str:
-    """Текст очередного хода сессии."""
+    """Текст очередного хода сессии: ответ на реплику или задача (task)."""
     parts = []
     if overrides_section:
         parts.append(overrides_section.strip() + "\n(Это обновлённые поправки, они заменяют прежние.)")
     if new_messages:
         lines = "\n".join(f"[{m['from']}]: {m['text']}" for m in new_messages)
         parts.append(f"Новые сообщения в чате с прошлого хода:\n{lines}")
+    if task:
+        parts.append(task)
+        return "\n\n".join(parts)
     parts.append(f"[Последняя реплика, на которую нужно ответить]: {user_message}")
     if hints.strip():
         parts.append(hints.strip())

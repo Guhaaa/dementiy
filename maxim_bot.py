@@ -476,9 +476,18 @@ class MaximResponseEngine:
         return text, thread_id
 
     async def _generate_session(
-        self, chat_id: int, user_message: str, context: list[dict], hints: str
+        self,
+        chat_id: int,
+        user_message: str | None,
+        context: list[dict],
+        hints: str,
+        *,
+        task: str | None = None,
+        web_search: bool = False,
     ) -> str:
-        """Ход в сессии Codex этого чата; при ошибке resume — новая сессия."""
+        """Ход в сессии Codex этого чата; при ошибке resume — новая сессия.
+
+        task — вместо ответа на реплику (например, написать первым)."""
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             turn_started = datetime.now().isoformat()
@@ -493,10 +502,12 @@ class MaximResponseEngine:
                 turn = build_turn(
                     new_messages, user_message, hints,
                     section if section_hash != session.get("overrides") else "",
+                    task,
                 )
                 try:
                     text, _ = await self._codex_run(
-                        turn, workdir, session=True, resume=session["thread_id"]
+                        turn, workdir, web_search=web_search,
+                        session=True, resume=session["thread_id"],
                     )
                     thread_id, turns = session["thread_id"], session.get("turns", 0) + 1
                 except RuntimeError as e:
@@ -505,9 +516,11 @@ class MaximResponseEngine:
                 prompt = "\n\n".join([
                     build_system_prompt(None, (), section),
                     SESSION_PREAMBLE,
-                    build_turn(new_messages, user_message, hints),
+                    build_turn(new_messages, user_message, hints, task=task),
                 ])
-                text, thread_id = await self._codex_run(prompt, workdir, session=True)
+                text, thread_id = await self._codex_run(
+                    prompt, workdir, web_search=web_search, session=True
+                )
                 turns = 1
                 logging.getLogger(__name__).info(f"[SESSION] новая сессия chat={chat_id}: {thread_id}")
             chat_sessions.update(
@@ -516,10 +529,12 @@ class MaximResponseEngine:
             )
             return text
 
-    async def proactive_post(self, recent: list[str]) -> str | None:
-        """Codex ищет в интернете находку и пишет о ней в стиле Максима."""
-        system_prompt = build_system_prompt(None, (), overrides.prompt_section())
-        raw = await self._codex_exec(f"{system_prompt}\n\n{build_task(recent)}", web_search=True)
+    async def proactive_post(self, chat_id: int, recent: list[str]) -> str | None:
+        """В сессии этого чата Codex ищет в интернете находку и пишет о ней."""
+        raw = await self._generate_session(
+            chat_id, None, channel_context.get_recent(chat_id, 30), "",
+            task=build_task(recent), web_search=True,
+        )
         return clean_post(raw)
 
     async def extract_correction(self, bot_text: str, persona_text: str) -> tuple[str, str] | None:
@@ -896,43 +911,48 @@ async def handle_group_message(message: types.Message):
     await _process_message(message)
 
 
-def _schedule_next() -> None:
-    proactive_state.next_at = next_post_time(
+def _schedule_next(chat_id: int) -> None:
+    when = next_post_time(
         datetime.now(PROACTIVE_TZ), PROACTIVE_MIN_HOURS, PROACTIVE_MAX_HOURS,
         PROACTIVE_START_HOUR, PROACTIVE_END_HOUR,
     )
-    proactive_state.save()
-    logger.info(f"[PROACTIVE] следующий пост: {proactive_state.next_at:%Y-%m-%d %H:%M %Z}")
+    proactive_state.set_next(chat_id, when)
+    logger.info(f"[PROACTIVE] chat_id={chat_id}: следующий пост {when:%Y-%m-%d %H:%M %Z}")
+
+
+async def _proactive_post(chat_id: int) -> None:
+    try:
+        post = await response_engine.proactive_post(chat_id, proactive_state.recent.get(chat_id, []))
+    except Exception as e:
+        logger.error(f"[PROACTIVE ERROR] chat_id={chat_id}: {e}")
+        return
+    if not post:
+        logger.info(f"[PROACTIVE] chat_id={chat_id}: пропуск, нет поста")
+        return
+    try:
+        await bot.send_message(chat_id, post, parse_mode=None)
+    except Exception as e:
+        logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
+        return
+    proactive_state.add_post(chat_id, post)
+    logger.info(f"[PROACTIVE] chat_id={chat_id}: {post[:100]!r}")
 
 
 async def proactive_loop() -> None:
-    """Иногда, по плавающему расписанию, бот сам пишет в группы."""
-    if proactive_state.next_at is None:
-        _schedule_next()
+    """У каждой группы своё плавающее расписание; пост пишется в её сессии."""
     while True:
-        wait = (proactive_state.next_at - datetime.now(PROACTIVE_TZ)).total_seconds()
-        if wait > 0:
-            await asyncio.sleep(min(wait, 600))
-            continue
         chats = PROACTIVE_CHAT_IDS or proactive_state.chats
-        if bot_started and chats:
-            try:
-                post = await response_engine.proactive_post(proactive_state.recent)
-            except Exception as e:
-                logger.error(f"[PROACTIVE ERROR] {e}")
-                post = None
-            if post:
-                for chat_id in chats:
-                    try:
-                        await bot.send_message(chat_id, post, parse_mode=None)
-                        channel_context.add(chat_id, post, "Максим (бот)")
-                        logger.info(f"[PROACTIVE] chat_id={chat_id}: {post[:100]!r}")
-                    except Exception as e:
-                        logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
-                proactive_state.add_post(post)
-            else:
-                logger.info("[PROACTIVE] пропуск: нет поста")
-        _schedule_next()
+        for chat_id in chats:
+            if chat_id not in proactive_state.next_at:
+                _schedule_next(chat_id)
+        now = datetime.now(PROACTIVE_TZ)
+        for chat_id in [c for c in chats if proactive_state.next_at[c] <= now]:
+            if bot_started:
+                await _proactive_post(chat_id)
+            _schedule_next(chat_id)
+        upcoming = [proactive_state.next_at[c] for c in chats]
+        wait = (min(upcoming) - datetime.now(PROACTIVE_TZ)).total_seconds() if upcoming else 600
+        await asyncio.sleep(min(max(wait, 5), 600))
 
 
 # ---------------------------------------------------------------------------

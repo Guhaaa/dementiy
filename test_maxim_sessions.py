@@ -28,6 +28,11 @@ class BuildTurnTests(unittest.TestCase):
         self.assertIn("SKIP", turn)
         self.assertNotIn("Новые сообщения", build_turn([], "x"))
 
+    def test_task_turn_replaces_reply(self):
+        turn = build_turn([{"from": "Женя", "text": "привет"}], None, task="Напиши первым.")
+        self.assertIn("Напиши первым.", turn)
+        self.assertNotIn("Последняя реплика", turn)
+
 
 class ChatSessionsTests(unittest.TestCase):
     def test_session_expires_after_max_turns(self):
