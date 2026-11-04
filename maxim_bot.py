@@ -26,11 +26,12 @@ import logging
 from datetime import datetime
 from dataclasses import dataclass, field
 
+from maxim_overrides import Overrides
 from maxim_style import build_system_prompt, choose_film_cues, choose_phrase_cue
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.client.default import DefaultBotProperties
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,8 @@ DEMENTIY_RE = re.compile(r"(?<![\w@])@?дементи(?:й|я|ю|ем|и)\b", re
 ADMIN_IDS: set[int] = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
 }
+# Каталог данных (поправки владельца). В Docker — том bot-data.
+DATA_DIR = os.getenv("DATA_DIR", "data")
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
 
@@ -422,9 +425,8 @@ class MaximResponseEngine:
                 len(film_cues),
                 [q.text[:50] for q in film_cues],
             )
-        return await self._generate(
-            user_message, context, build_system_prompt(cue, film_cues)
-        )
+        system_prompt = build_system_prompt(cue, film_cues, overrides.prompt_section())
+        return await self._generate(user_message, context, system_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +472,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 rate_limiter = RateLimiter()
+overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
 response_engine = MaximResponseEngine()
 channel_context = ChannelContext()
 
@@ -499,7 +502,7 @@ async def cmd_start(message: types.Message):
     if not await _owner_private(message):
         return
     bot_started = True
-    await message.answer("🤖 Бот Максима запущен. Слушаю канал.")
+    await message.answer("🤖 Бот Максима запущен. Слушаю канал. Команды: /help")
 
 
 @dp.message(Command("stop"))
@@ -543,6 +546,82 @@ async def cmd_debug(message: types.Message):
         f"Причины: {', '.join(trigger.reasons) if trigger.reasons else '—'}\n"
         f"Текст: {last['text'][:200]}"
     )
+
+
+HELP_TEXT = (
+    "Команды владельца (в личке):\n"
+    "/rule <текст> — добавить правило поведения\n"
+    "/rules — правила и примеры\n"
+    "/unrule <N> — удалить правило\n"
+    "/unbad <N> — удалить пример\n"
+    "/start, /stop, /status, /debug\n\n"
+    "/bad <как надо> — reply на неудачный ответ бота, в группе или в личке."
+)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    if not await _owner_private(message):
+        return
+    await message.answer(HELP_TEXT, parse_mode=None)
+
+
+@dp.message(Command("rule"))
+async def cmd_rule(message: types.Message, command: CommandObject):
+    if not await _owner_private(message):
+        return
+    if not command.args:
+        await message.answer("Формат: /rule не шути про Марсель")
+        return
+    number = overrides.add_rule(command.args)
+    logger.info(f"[OVERRIDE] rule #{number} from user_id={message.from_user.id}: {command.args!r}")
+    await message.answer(f"Правило {number} добавлено.")
+
+
+@dp.message(Command("rules"))
+async def cmd_rules(message: types.Message):
+    if not await _owner_private(message):
+        return
+    await message.answer(overrides.listing(), parse_mode=None)
+
+
+async def _remove(message: types.Message, args: str | None, remove, done: str):
+    if not await _owner_private(message):
+        return
+    if not args or not args.strip().isdigit():
+        await message.answer("Формат: номер из /rules, например 2")
+        return
+    removed = remove(int(args))
+    await message.answer(done.format(args.strip()) if removed else "Нет такого номера.")
+
+
+@dp.message(Command("unrule"))
+async def cmd_unrule(message: types.Message, command: CommandObject):
+    await _remove(message, command.args, overrides.remove_rule, "Правило {} удалено.")
+
+
+@dp.message(Command("unbad"))
+async def cmd_unbad(message: types.Message, command: CommandObject):
+    await _remove(message, command.args, overrides.remove_example, "Пример {} удалён.")
+
+
+@dp.message(Command("bad"))
+async def cmd_bad(message: types.Message, command: CommandObject):
+    """Reply на ответ бота: «так было плохо, надо вот так». Работает и в группе."""
+    if not is_owner(message):
+        return
+    target = message.reply_to_message
+    if (
+        target is None
+        or target.from_user is None
+        or target.from_user.id != BOT_ID
+        or not command.args
+    ):
+        await message.reply("Сделайте reply на ответ бота: /bad как надо было ответить")
+        return
+    number = overrides.add_example(target.text or target.caption or "", command.args)
+    logger.info(f"[OVERRIDE] example #{number} from user_id={message.from_user.id}")
+    await message.reply("Учту.")
 
 
 async def _process_message(message: types.Message, *, private: bool = False):
