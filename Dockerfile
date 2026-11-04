@@ -15,10 +15,10 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     CODEX_HOME=/home/node/.codex
 
-COPY maxim_bot.py maxim_style.py ./
+COPY maxim_bot.py maxim_style.py maxim_overrides.py ./
 
 # Пользователь node (uid 1000) уже есть в базовом образе
-RUN mkdir -p /home/node/.codex && chown node:node /home/node/.codex
+RUN mkdir -p /home/node/.codex /app/data && chown node:node /home/node/.codex /app/data
 USER node
 
 CMD ["python3", "maxim_bot.py"]

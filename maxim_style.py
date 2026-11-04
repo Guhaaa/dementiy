@@ -655,6 +655,7 @@ def choose_film_cues(
 def build_system_prompt(
     cue: PhraseCue | None = None,
     film_cues: Sequence[FilmQuote] = (),
+    overrides_section: str = "",
 ) -> str:
     """Build the stable persona prompt with at most one optional style cue
     and an optional shortlist of film quotes for the LLM to optionally use."""
@@ -678,6 +679,8 @@ def build_system_prompt(
                 f"{i}. «{q.text}» — {q.film} ({q.context_hint})"
             )
         parts.append("\n".join(lines))
+    if overrides_section:
+        parts.append(overrides_section)
     parts.append(
         "\n\nНе объясняй наличие подсказок в ответе. Верни только готовую реплику для чата."
     )
