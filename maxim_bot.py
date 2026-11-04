@@ -24,9 +24,11 @@ import random
 import asyncio
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
+from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
 from maxim_style import build_system_prompt, choose_film_cues, choose_phrase_cue
 
 from aiogram import Bot, Dispatcher, types
@@ -97,6 +99,17 @@ ADMIN_IDS: set[int] = {
 PERSONA_IDS: set[int] = {
     int(x) for x in os.getenv("PERSONA_IDS", "").replace(" ", "").split(",") if x
 }
+# Бот пишет первым: находка из интернета в стиле Максима (только LLM_PROVIDER=codex)
+PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "0").lower() not in {"0", "false", "no"}
+# Пусто = все группы, где бот видел сообщения
+PROACTIVE_CHAT_IDS: set[int] = {
+    int(x) for x in os.getenv("PROACTIVE_CHAT_IDS", "").replace(" ", "").split(",") if x
+}
+PROACTIVE_MIN_HOURS = float(os.getenv("PROACTIVE_MIN_HOURS", "12"))
+PROACTIVE_MAX_HOURS = float(os.getenv("PROACTIVE_MAX_HOURS", "48"))
+_start, _end = os.getenv("PROACTIVE_HOURS", "10-22").split("-")
+PROACTIVE_START_HOUR, PROACTIVE_END_HOUR = int(_start), int(_end)
+PROACTIVE_TZ = ZoneInfo(os.getenv("PROACTIVE_TZ", "Europe/Paris"))
 # Каталог данных (поправки Максима). В Docker — том bot-data.
 DATA_DIR = os.getenv("DATA_DIR", "data")
 BOT_ID: int | None = None  # заполняется в main() через get_me()
@@ -361,14 +374,17 @@ class MaximResponseEngine:
     async def _generate_codex(
         self, user_message: str, context: list[dict], system_prompt: str
     ) -> str:
-        """Вызывает `codex exec` в пустом каталоге, в песочнице CODEX_SANDBOX."""
         context_block = "\n".join(self._context_lines(context)) or "(нет)"
-        prompt = (
+        return await self._codex_exec(
             f"{system_prompt}\n\n"
             "Ответь одной репликой в чат. Не запускай команды и не читай файлы.\n\n"
             f"Контекст предыдущих реплик:\n{context_block}\n\n"
             f"[Последняя реплика, на которую нужно ответить]: {user_message}"
         )
+
+    async def _codex_exec(self, prompt: str, *, web_search: bool = False) -> str:
+        """Вызывает `codex exec` в пустом каталоге, в песочнице CODEX_SANDBOX."""
+        timeout = max(CODEX_TIMEOUT, 300) if web_search else CODEX_TIMEOUT
         with tempfile.TemporaryDirectory(prefix="maxim-codex-") as workdir:
             out_file = os.path.join(workdir, "answer.txt")
             args = [
@@ -377,6 +393,7 @@ class MaximResponseEngine:
                 "--sandbox", CODEX_SANDBOX, "--color", "never",
                 "-C", workdir, "-o", out_file,
                 "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+                "-c", f'web_search="{"live" if web_search else "disabled"}"',
             ]
             if CODEX_MODEL:
                 args += ["-m", CODEX_MODEL]
@@ -390,18 +407,24 @@ class MaximResponseEngine:
             )
             try:
                 _, stderr = await asyncio.wait_for(
-                    proc.communicate(prompt.encode()), timeout=CODEX_TIMEOUT
+                    proc.communicate(prompt.encode()), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-                raise RuntimeError(f"codex exec: таймаут {CODEX_TIMEOUT:.0f}с")
+                raise RuntimeError(f"codex exec: таймаут {timeout:.0f}с")
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"codex exec rc={proc.returncode}: {stderr.decode(errors='replace')[-300:]}"
                 )
             with open(out_file, encoding="utf-8") as f:
                 return f.read().strip()
+
+    async def proactive_post(self, recent: list[str]) -> str | None:
+        """Codex ищет в интернете находку и пишет о ней в стиле Максима."""
+        system_prompt = build_system_prompt(None, (), overrides.prompt_section())
+        raw = await self._codex_exec(f"{system_prompt}\n\n{build_task(recent)}", web_search=True)
+        return clean_post(raw)
 
     async def extract_correction(self, bot_text: str, persona_text: str) -> tuple[str, str] | None:
         """Агент: есть ли в реплике Максима поправка к поведению бота."""
@@ -489,6 +512,7 @@ bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMod
 dp = Dispatcher()
 rate_limiter = RateLimiter()
 overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
+proactive_state = ProactiveState(os.path.join(DATA_DIR, "proactive.json"))
 response_engine = MaximResponseEngine()
 channel_context = ChannelContext()
 
@@ -755,8 +779,49 @@ async def handle_group_message(message: types.Message):
             return
         await _process_message(message, private=True)
         return
-    logger.info(f"[HANDLER] group_message: chat={message.chat.type} text={message.text!r}")
+    logger.info(f"[HANDLER] group_message: chat={message.chat.type} chat_id={message.chat.id} text={message.text!r}")
+    if message.chat.type in ("group", "supergroup"):
+        proactive_state.remember_chat(message.chat.id)
     await _process_message(message)
+
+
+def _schedule_next() -> None:
+    proactive_state.next_at = next_post_time(
+        datetime.now(PROACTIVE_TZ), PROACTIVE_MIN_HOURS, PROACTIVE_MAX_HOURS,
+        PROACTIVE_START_HOUR, PROACTIVE_END_HOUR,
+    )
+    proactive_state.save()
+    logger.info(f"[PROACTIVE] следующий пост: {proactive_state.next_at:%Y-%m-%d %H:%M %Z}")
+
+
+async def proactive_loop() -> None:
+    """Иногда, по плавающему расписанию, бот сам пишет в группы."""
+    if proactive_state.next_at is None:
+        _schedule_next()
+    while True:
+        wait = (proactive_state.next_at - datetime.now(PROACTIVE_TZ)).total_seconds()
+        if wait > 0:
+            await asyncio.sleep(min(wait, 600))
+            continue
+        chats = PROACTIVE_CHAT_IDS or proactive_state.chats
+        if bot_started and chats:
+            try:
+                post = await response_engine.proactive_post(proactive_state.recent)
+            except Exception as e:
+                logger.error(f"[PROACTIVE ERROR] {e}")
+                post = None
+            if post:
+                for chat_id in chats:
+                    try:
+                        await bot.send_message(chat_id, post, parse_mode=None)
+                        channel_context.add(chat_id, post, "Максим (бот)")
+                        logger.info(f"[PROACTIVE] chat_id={chat_id}: {post[:100]!r}")
+                    except Exception as e:
+                        logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
+                proactive_state.add_post(post)
+            else:
+                logger.info("[PROACTIVE] пропуск: нет поста")
+        _schedule_next()
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +838,10 @@ async def main():
     BOT_ID = me.id
     BOT_USERNAME = me.username
     logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{BOT_USERNAME}")
+    if PROACTIVE_ENABLED and LLM_PROVIDER == "codex":
+        asyncio.create_task(proactive_loop())
+    elif PROACTIVE_ENABLED:
+        logger.warning("[PROACTIVE] нужен LLM_PROVIDER=codex (веб-поиск), посты первым выключены")
     await dp.start_polling(bot)
 
 
