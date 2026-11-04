@@ -16,6 +16,7 @@
                             Оставьте пустым чтобы слушать ВСЕ группы, куда бот добавлен.
 """
 
+import json
 import os
 import re
 import tempfile
@@ -23,13 +24,15 @@ import time
 import random
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
 from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
-from maxim_style import build_system_prompt, choose_film_cues, choose_phrase_cue
+from maxim_sessions import SESSION_PREAMBLE, ChatSessions, build_turn, overrides_hash
+from maxim_style import build_hints, build_system_prompt, choose_film_cues, choose_phrase_cue
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -63,6 +66,8 @@ CODEX_MODEL = os.getenv("CODEX_MODEL", "")  # пусто = модель по у�
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "low")
 CODEX_TIMEOUT = float(os.getenv("CODEX_TIMEOUT", "120"))
 CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "read-only")
+# Сессия Codex на чат: после стольких ходов начинается новая
+CODEX_SESSION_MAX_TURNS = int(os.getenv("CODEX_SESSION_MAX_TURNS", "150"))
 # Секреты бота не передаём в процесс codex
 _CODEX_HIDDEN_ENV = {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
 
@@ -70,6 +75,8 @@ _CODEX_HIDDEN_ENV = {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"
 COOLDOWN_SECONDS = 180        # 3 минуты между любыми ответами
 PER_USER_COOLDOWN = 300       # 5 минут между ответами одному человеку
 DAILY_LIMIT = 20              # максимум ответов в сутки
+# Потолок прямых ответов в одной группе за 10 минут (защита от спама)
+DIRECT_MAX_PER_10MIN = int(os.getenv("DIRECT_MAX_PER_10MIN", "6"))
 TRIGGER_THRESHOLD = 25        # минимальный score для срабатывания
 
 # Случайность — имитация живого настроения
@@ -260,6 +267,7 @@ class RateLimiter:
         self.user_last_response: dict[int, float] = {}  # user_id → timestamp
         self.daily_count: int = 0
         self.day_start: str = datetime.now().strftime("%Y-%m-%d")
+        self.direct_by_chat: dict[int, deque[float]] = {}
 
     def _reset_daily(self):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -286,6 +294,17 @@ class RateLimiter:
 
         return True, "ok"
 
+    def direct_ok(self, chat_id: int) -> bool:
+        """Не больше DIRECT_MAX_PER_10MIN прямых ответов в чате за 10 минут."""
+        recent = self.direct_by_chat.setdefault(chat_id, deque())
+        now = time.time()
+        while recent and now - recent[0] > 600:
+            recent.popleft()
+        return len(recent) < DIRECT_MAX_PER_10MIN
+
+    def record_direct(self, chat_id: int):
+        self.direct_by_chat.setdefault(chat_id, deque()).append(time.time())
+
     def record_response(self, user_id: int, *, cooldown: bool = True):
         """cooldown=False — прямое обращение: только счётчик за сутки."""
         self._reset_daily()
@@ -306,6 +325,7 @@ class MaximResponseEngine:
         self.client = None
         self._recent_cues: list[str] = []
         self._recent_film_quotes: list[str] = []
+        self._chat_locks: dict[int, asyncio.Lock] = {}
         self._init_client()
 
     def _init_client(self):
@@ -383,30 +403,54 @@ class MaximResponseEngine:
         )
 
     async def _codex_exec(self, prompt: str, *, web_search: bool = False) -> str:
-        """Вызывает `codex exec` в пустом каталоге, в песочнице CODEX_SANDBOX."""
-        timeout = max(CODEX_TIMEOUT, 300) if web_search else CODEX_TIMEOUT
+        """Разовый вызов без сохранения сессии."""
         with tempfile.TemporaryDirectory(prefix="maxim-codex-") as workdir:
-            out_file = os.path.join(workdir, "answer.txt")
-            args = [
-                CODEX_BIN, "exec",
-                "--skip-git-repo-check", "--ephemeral",
-                "--sandbox", CODEX_SANDBOX, "--color", "never",
-                "-C", workdir, "-o", out_file,
-                "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
-                "-c", f'web_search="{"live" if web_search else "disabled"}"',
-            ]
-            if CODEX_MODEL:
-                args += ["-m", CODEX_MODEL]
-            args.append("-")
+            text, _ = await self._codex_run(prompt, workdir, web_search=web_search)
+            return text
+
+    async def _codex_run(
+        self,
+        prompt: str,
+        workdir: str,
+        *,
+        web_search: bool = False,
+        session: bool = False,
+        resume: str | None = None,
+    ) -> tuple[str, str | None]:
+        """`codex exec` в каталоге workdir, в песочнице CODEX_SANDBOX.
+
+        session=True — сессия сохраняется; без resume начинается новая,
+        и вторым значением возвращается её thread_id.
+        """
+        timeout = max(CODEX_TIMEOUT, 300) if web_search else CODEX_TIMEOUT
+        out_fd, out_file = tempfile.mkstemp(prefix="maxim-answer-", suffix=".txt")
+        os.close(out_fd)
+        args = [
+            CODEX_BIN, "exec",
+            "--skip-git-repo-check", "--sandbox", CODEX_SANDBOX, "--color", "never",
+            "-C", workdir, "-o", out_file,
+            "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            "-c", f'web_search="{"live" if web_search else "disabled"}"',
+        ]
+        if CODEX_MODEL:
+            args += ["-m", CODEX_MODEL]
+        if not session:
+            args.append("--ephemeral")
+        elif resume is None:
+            args.append("--json")  # первое событие несёт thread_id
+        if resume:
+            args += ["resume", resume]
+        args.append("-")
+        try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={k: v for k, v in os.environ.items() if k not in _CODEX_HIDDEN_ENV},
             )
             try:
-                _, stderr = await asyncio.wait_for(
+                stdout, stderr = await asyncio.wait_for(
                     proc.communicate(prompt.encode()), timeout=timeout
                 )
             except asyncio.TimeoutError:
@@ -418,7 +462,59 @@ class MaximResponseEngine:
                     f"codex exec rc={proc.returncode}: {stderr.decode(errors='replace')[-300:]}"
                 )
             with open(out_file, encoding="utf-8") as f:
-                return f.read().strip()
+                text = f.read().strip()
+        finally:
+            os.unlink(out_file)
+        thread_id = None
+        if session and resume is None:
+            for line in stdout.decode(errors="replace").splitlines():
+                if '"thread.started"' in line:
+                    thread_id = json.loads(line).get("thread_id")
+                    break
+            if not thread_id:
+                raise RuntimeError("codex exec: нет thread_id в --json")
+        return text, thread_id
+
+    async def _generate_session(
+        self, chat_id: int, user_message: str, context: list[dict], hints: str
+    ) -> str:
+        """Ход в сессии Codex этого чата; при ошибке resume — новая сессия."""
+        lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            turn_started = datetime.now().isoformat()
+            workdir = os.path.abspath(os.path.join(DATA_DIR, "chats", str(chat_id)))
+            os.makedirs(workdir, exist_ok=True)
+            section = overrides.prompt_section()
+            section_hash = overrides_hash(section)
+            session = chat_sessions.get(chat_id)
+            new_messages = [m for m in context if m["date"] > (session or {}).get("last_ts", "")][-20:]
+            text = None
+            if session:
+                turn = build_turn(
+                    new_messages, user_message, hints,
+                    section if section_hash != session.get("overrides") else "",
+                )
+                try:
+                    text, _ = await self._codex_run(
+                        turn, workdir, session=True, resume=session["thread_id"]
+                    )
+                    thread_id, turns = session["thread_id"], session.get("turns", 0) + 1
+                except RuntimeError as e:
+                    logging.getLogger(__name__).warning(f"[SESSION] resume chat={chat_id} не удался: {e}")
+            if text is None:
+                prompt = "\n\n".join([
+                    build_system_prompt(None, (), section),
+                    SESSION_PREAMBLE,
+                    build_turn(new_messages, user_message, hints),
+                ])
+                text, thread_id = await self._codex_run(prompt, workdir, session=True)
+                turns = 1
+                logging.getLogger(__name__).info(f"[SESSION] новая сессия chat={chat_id}: {thread_id}")
+            chat_sessions.update(
+                chat_id, thread_id=thread_id, turns=turns,
+                last_ts=turn_started, overrides=section_hash,
+            )
+            return text
 
     async def proactive_post(self, recent: list[str]) -> str | None:
         """Codex ищет в интернете находку и пишет о ней в стиле Максима."""
@@ -435,7 +531,9 @@ class MaximResponseEngine:
         )
         return parse_correction(raw)
 
-    async def generate(self, user_message: str, context: list[dict] | None = None) -> str:
+    async def generate(
+        self, user_message: str, context: list[dict] | None = None, chat_id: int | None = None
+    ) -> str:
         """Генерирует ответ и изредка предлагает модели одну уместную фразу
         и/или 2–3 крылатые цитаты из советских фильмов."""
         context = context or []
@@ -463,6 +561,10 @@ class MaximResponseEngine:
                 "[FILM-CUE] selected %d quotes: %s",
                 len(film_cues),
                 [q.text[:50] for q in film_cues],
+            )
+        if LLM_PROVIDER == "codex" and chat_id is not None:
+            return await self._generate_session(
+                chat_id, user_message, context, build_hints(cue, film_cues)
             )
         system_prompt = build_system_prompt(cue, film_cues, overrides.prompt_section())
         return await self._generate(user_message, context, system_prompt)
@@ -513,6 +615,7 @@ dp = Dispatcher()
 rate_limiter = RateLimiter()
 overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
 proactive_state = ProactiveState(os.path.join(DATA_DIR, "proactive.json"))
+chat_sessions = ChatSessions(os.path.join(DATA_DIR, "sessions.json"), CODEX_SESSION_MAX_TURNS)
 response_engine = MaximResponseEngine()
 channel_context = ChannelContext()
 
@@ -686,7 +789,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Берём только предыдущие реплики этого чата. Текущую добавляем после
     # снимка, чтобы LLM не увидела её дважды и чтобы разные чаты не смешивались.
-    context_messages = channel_context.get_recent(chat_id, 5)
+    context_messages = channel_context.get_recent(chat_id, 30)
     channel_context.add(chat_id, text, sender)
 
     # Проверяем, ответил ли кто-то на сообщение бота
@@ -726,7 +829,10 @@ async def _process_message(message: types.Message, *, private: bool = False):
     if not trigger.will_respond:
         return
 
-    # reply и @упоминание — полностью пропускаем rate limiter.
+    # reply и @упоминание — без кулдауна, но с потолком на чат против спама
+    if force_respond and not private and not rate_limiter.direct_ok(chat_id):
+        logger.info(f"[RATE-LIMIT] потолок прямых ответов в chat_id={chat_id}")
+        return
     if not force_respond:
         can_respond, reason = rate_limiter.can_respond(user_id)
         if not can_respond:
@@ -735,7 +841,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Генерируем ответ
     try:
-        response = await response_engine.generate(text, context_messages)
+        response = await response_engine.generate(text, context_messages, chat_id)
     except Exception as e:
         logger.error(f"[LLM ERROR] {e}")
         return
@@ -748,6 +854,9 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     if not response.strip():
         return
+    if response.strip().upper().startswith("SKIP"):
+        logger.info(f"[SKIP-LLM] модель решила не отвечать: from={sender}")
+        return
 
     # Отправляем
     try:
@@ -755,6 +864,8 @@ async def _process_message(message: types.Message, *, private: bool = False):
         # превращаться в Telegram entities и ломать отправку.
         await message.reply(response, parse_mode=None)
         rate_limiter.record_response(user_id, cooldown=not force_respond)
+        if force_respond:
+            rate_limiter.record_direct(chat_id)
         logger.info(f"[SENT] to={sender} trigger_score={trigger.score} response={response[:100]}")
     except Exception as e:
         logger.error(f"[SEND ERROR] {e}")
