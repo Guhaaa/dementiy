@@ -26,11 +26,21 @@ class DirectAddressTests(unittest.TestCase):
 
     def test_direct_response_skips_cooldown(self):
         limiter = maxim_bot.RateLimiter()
-        limiter.record_response(1, cooldown=False)
-        self.assertEqual(limiter.can_respond(1), (True, "ok"))
-        self.assertEqual(limiter.daily_count, 1)
-        limiter.record_response(1)
-        self.assertFalse(limiter.can_respond(1)[0])
+        limiter.record_response(-1, 1, cooldown=False)
+        self.assertEqual(limiter.can_respond(-1, 1), (True, "ok"))
+        self.assertEqual(limiter.daily_count, {-1: 1})
+        limiter.record_response(-1, 1)
+        self.assertFalse(limiter.can_respond(-1, 1)[0])
+
+    def test_cooldown_and_daily_limit_are_per_chat(self):
+        limiter = maxim_bot.RateLimiter()
+        limiter.record_response(-1, 1)
+        self.assertTrue(limiter.can_respond(-2, 1)[0])
+        self.assertTrue(limiter.can_respond(-2, 7)[0])
+        for _ in range(maxim_bot.DAILY_LIMIT):
+            limiter.record_response(-3, 1, cooldown=False)
+        self.assertEqual(limiter.can_respond(-3, 2)[1], f"дневной лимит ({maxim_bot.DAILY_LIMIT})")
+        self.assertTrue(limiter.can_respond(-2, 2)[0])
 
 
 class OwnerTests(unittest.TestCase):

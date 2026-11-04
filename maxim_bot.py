@@ -73,10 +73,10 @@ CODEX_SESSION_MAX_TURNS = int(os.getenv("CODEX_SESSION_MAX_TURNS", "150"))
 # Секреты бота не передаём в процесс codex
 _CODEX_HIDDEN_ENV = {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
 
-# Rate limiting. Прямые обращения к боту его не проходят.
-COOLDOWN_SECONDS = 180        # 3 минуты между любыми ответами
-PER_USER_COOLDOWN = 300       # 5 минут между ответами одному человеку
-DAILY_LIMIT = 20              # максимум ответов в сутки
+# Rate limiting — отдельно для каждой группы. Прямые обращения к боту его не проходят.
+COOLDOWN_SECONDS = 180        # 3 минуты между любыми ответами в группе
+PER_USER_COOLDOWN = 300       # 5 минут между ответами одному человеку в группе
+DAILY_LIMIT = 20              # максимум ответов в группе за сутки
 # Потолок прямых ответов в одной группе за 10 минут (защита от спама)
 DIRECT_MAX_PER_10MIN = int(os.getenv("DIRECT_MAX_PER_10MIN", "6"))
 TRIGGER_THRESHOLD = 25        # минимальный score для срабатывания
@@ -264,35 +264,36 @@ def is_bot_mentioned(text: str, username: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
+    """Кулдауны и дневной лимит — отдельно для каждой группы."""
+
     def __init__(self):
-        self.last_response: float = 0.0          # timestamp последнего ответа
-        self.user_last_response: dict[int, float] = {}  # user_id → timestamp
-        self.daily_count: int = 0
+        self.last_response: dict[int, float] = {}               # chat_id → timestamp
+        self.user_last_response: dict[tuple[int, int], float] = {}  # (chat_id, user_id) → timestamp
+        self.daily_count: dict[int, int] = {}                   # chat_id → ответов сегодня
         self.day_start: str = datetime.now().strftime("%Y-%m-%d")
         self.direct_by_chat: dict[int, deque[float]] = {}
 
     def _reset_daily(self):
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self.day_start:
-            self.daily_count = 0
+            self.daily_count = {}
             self.day_start = today
 
-    def can_respond(self, user_id: int) -> tuple[bool, str]:
-        """Проверяет, можно ли ответить. Возвращает (разрешено, причина)."""
+    def can_respond(self, chat_id: int, user_id: int) -> tuple[bool, str]:
+        """Проверяет, можно ли ответить в этом чате. Возвращает (разрешено, причина)."""
         self._reset_daily()
         now = time.time()
 
-        if self.daily_count >= DAILY_LIMIT:
+        if self.daily_count.get(chat_id, 0) >= DAILY_LIMIT:
             return False, f"дневной лимит ({DAILY_LIMIT})"
 
-        if now - self.last_response < COOLDOWN_SECONDS:
-            remaining = int(COOLDOWN_SECONDS - (now - self.last_response))
-            return False, f"кулдаун ({remaining}с)"
+        since_chat = now - self.last_response.get(chat_id, 0.0)
+        if since_chat < COOLDOWN_SECONDS:
+            return False, f"кулдаун ({int(COOLDOWN_SECONDS - since_chat)}с)"
 
-        if user_id in self.user_last_response:
-            if now - self.user_last_response[user_id] < PER_USER_COOLDOWN:
-                remaining = int(PER_USER_COOLDOWN - (now - self.user_last_response[user_id]))
-                return False, f"персональный кулдаун ({remaining}с)"
+        since_user = now - self.user_last_response.get((chat_id, user_id), 0.0)
+        if since_user < PER_USER_COOLDOWN:
+            return False, f"персональный кулдаун ({int(PER_USER_COOLDOWN - since_user)}с)"
 
         return True, "ok"
 
@@ -307,15 +308,15 @@ class RateLimiter:
     def record_direct(self, chat_id: int):
         self.direct_by_chat.setdefault(chat_id, deque()).append(time.time())
 
-    def record_response(self, user_id: int, *, cooldown: bool = True):
+    def record_response(self, chat_id: int, user_id: int, *, cooldown: bool = True):
         """cooldown=False — прямое обращение: только счётчик за сутки."""
         self._reset_daily()
-        self.daily_count += 1
+        self.daily_count[chat_id] = self.daily_count.get(chat_id, 0) + 1
         if not cooldown:
             return
         now = time.time()
-        self.last_response = now
-        self.user_last_response[user_id] = now
+        self.last_response[chat_id] = now
+        self.user_last_response[(chat_id, user_id)] = now
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +683,8 @@ async def cmd_status(message: types.Message):
         await message.answer(
             f"📊 Статус:\n"
             f"Активен: {'да' if bot_started else 'нет'}\n"
-            f"Ответов сегодня: {rate_limiter.daily_count}/{DAILY_LIMIT}\n"
+            f"Ответов сегодня: {sum(rate_limiter.daily_count.values())} "
+            f"(лимит {DAILY_LIMIT} на чат)\n"
             f"Контекст: {channel_context.total_size} сообщений\n"
         )
     except Exception as e:
@@ -865,7 +867,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
         logger.info(f"[RATE-LIMIT] потолок прямых ответов в chat_id={chat_id}")
         return
     if not force_respond:
-        can_respond, reason = rate_limiter.can_respond(user_id)
+        can_respond, reason = rate_limiter.can_respond(chat_id, user_id)
         if not can_respond:
             logger.info(f"[RATE-LIMIT] {reason} for {sender}")
             return
@@ -892,7 +894,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # Отправляем
     try:
         await send_formatted(chat_id, response, reply_to=message)
-        rate_limiter.record_response(user_id, cooldown=not force_respond)
+        rate_limiter.record_response(chat_id, user_id, cooldown=not force_respond)
         if force_respond:
             rate_limiter.record_direct(chat_id)
         logger.info(f"[SENT] to={sender} trigger_score={trigger.score} response={response[:100]}")
