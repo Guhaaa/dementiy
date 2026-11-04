@@ -678,8 +678,8 @@ async def _process_message(message: types.Message, *, private: bool = False):
     )
     force_respond = private or is_reply_to_bot or is_mentioned
 
-    # Максим обращается к боту: сначала агент ищет в реплике поправку
-    if user_id in PERSONA_IDS and (is_reply_to_bot or is_mentioned):
+    # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку
+    if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):
         bot_text = ""
         if is_reply_to_bot:
             bot_text = message.reply_to_message.text or message.reply_to_message.caption or ""
