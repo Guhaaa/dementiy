@@ -25,6 +25,7 @@ import random
 import asyncio
 import logging
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -98,6 +99,7 @@ BOT_AUTO_START = os.getenv("BOT_AUTO_START", "1").lower() not in {"0", "false", 
 REPLY_FORCE_RESPOND = os.getenv("REPLY_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
 MENTION_FORCE_RESPOND = os.getenv("MENTION_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
 # «Дементий» во всех падежах. «Максим»/«Макс» сюда не входят: в чате их несколько.
+URL_RE = re.compile(r"https?://\S+")
 DEMENTIY_RE = re.compile(r"(?<![\w@])@?дементи(?:й|я|ю|ем|и)\b", re.IGNORECASE)
 # Владельцы бота: только они управляют командами и говорят с ботом в личке
 ADMIN_IDS: set[int] = {
@@ -499,7 +501,11 @@ class MaximResponseEngine:
             section = overrides.prompt_section()
             section_hash = overrides_hash(section)
             session = chat_sessions.get(chat_id)
-            new_messages = [m for m in context if m["date"] > (session or {}).get("last_ts", "")][-20:]
+            # Свои ответы сессия помнит сама — передаём только чужие сообщения
+            new_messages = [
+                m for m in context
+                if m["date"] > (session or {}).get("last_ts", "") and not m.get("bot")
+            ][-20:]
             text = None
             if session:
                 turn = build_turn(
@@ -540,10 +546,18 @@ class MaximResponseEngine:
         )
         return clean_post(raw)
 
-    async def extract_correction(self, bot_text: str, persona_text: str) -> tuple[str, str] | None:
-        """Агент: есть ли в реплике Максима поправка к поведению бота."""
+    async def extract_correction(
+        self, bot_text: str, persona_text: str, context: list[dict] | None = None
+    ) -> tuple[str, str] | None:
+        """Агент: есть ли в реплике Максима поправка к поведению бота.
+
+        context — последние сообщения чата вместе с ответами бота: без них
+        «учти это» непонятно, к чему относится."""
+        history = "\n".join(f"[{m['from']}]: {m['text'][:600]}" for m in (context or [])[-8:])
         raw = await self._generate(
-            f"Реплика бота: «{bot_text}»\nСообщение Максима: «{persona_text}»",
+            f"Недавний разговор:\n{history or '(нет)'}\n\n"
+            f"Реплика бота, на которую отвечает Максим: «{bot_text}»\n"
+            f"Сообщение Максима: «{persona_text}»",
             [],
             EXTRACT_PROMPT,
         )
@@ -552,6 +566,8 @@ class MaximResponseEngine:
     async def generate(
         self, user_message: str, context: list[dict] | None = None, chat_id: int | None = None
     ) -> str:
+        # Ссылка в сообщении — Codex может открыть её через web search
+        web_search = LLM_PROVIDER == "codex" and bool(URL_RE.search(user_message))
         """Генерирует ответ и изредка предлагает модели одну уместную фразу
         и/или 2–3 крылатые цитаты из советских фильмов."""
         context = context or []
@@ -580,9 +596,12 @@ class MaximResponseEngine:
                 len(film_cues),
                 [q.text[:50] for q in film_cues],
             )
+        hints = build_hints(cue, film_cues)
+        if web_search:
+            hints += "\n\nВ реплике есть ссылка. Если для ответа нужно её содержимое — открой её через web search."
         if LLM_PROVIDER == "codex" and chat_id is not None:
             return await self._generate_session(
-                chat_id, user_message, context, build_hints(cue, film_cues)
+                chat_id, user_message, context, hints, web_search=web_search
             )
         system_prompt = build_system_prompt(cue, film_cues, overrides.prompt_section())
         return await self._generate(user_message, context, system_prompt)
@@ -591,6 +610,9 @@ class MaximResponseEngine:
 # ---------------------------------------------------------------------------
 # Контекст канала (хранит последние N сообщений)
 # ---------------------------------------------------------------------------
+
+BOT_LABEL = "Бот (ты)"
+
 
 class ChannelContext:
     """Keeps independent conversation history for every channel/group."""
@@ -604,18 +626,20 @@ class ChannelContext:
     def total_size(self) -> int:
         return sum(len(messages) for messages in self.messages_by_chat.values())
 
-    def add(self, chat_id: int, text: str, sender: str):
+    def add(self, chat_id: int, text: str, sender: str, *, is_bot: bool = False):
         message = {
             "chat_id": chat_id,
             "text": text,
-            "from": sender,
+            "from": BOT_LABEL if is_bot else sender,
             "date": datetime.now().isoformat(),
+            "bot": is_bot,
         }
         messages = self.messages_by_chat.setdefault(chat_id, [])
         messages.append(message)
         if len(messages) > self.max_size:
             del messages[:-self.max_size]
-        self.last_message = message
+        if not is_bot:
+            self.last_message = message
 
     def get_recent(self, chat_id: int, count: int = 5) -> list[dict]:
         return self.messages_by_chat.get(chat_id, [])[-count:]
@@ -625,7 +649,20 @@ class ChannelContext:
 # Telegram Bot
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+# Лог и в stdout, и в файл на томе: `docker compose up --build` пересоздаёт
+# контейнер, и его собственный лог пропадает
+os.makedirs(os.path.join(DATA_DIR, "logs"), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            os.path.join(DATA_DIR, "logs", "bot.log"),
+            maxBytes=5_000_000, backupCount=5, encoding="utf-8",
+        ),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -729,11 +766,13 @@ pending_corrections: dict[int, tuple[str, str, str]] = {}
 _next_correction_id = 0
 
 
-async def _propose_correction(message: types.Message, text: str, bot_text: str) -> bool:
+async def _propose_correction(
+    message: types.Message, text: str, bot_text: str, context: list[dict]
+) -> bool:
     """Если в реплике Максима есть поправка — предлагает её с кнопками. True, если предложил."""
     global _next_correction_id
     try:
-        correction = await response_engine.extract_correction(bot_text, text)
+        correction = await response_engine.extract_correction(bot_text, text, context)
     except Exception as e:
         logger.error(f"[CORRECTION ERROR] {e}")
         return False
@@ -840,10 +879,11 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку
     if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):
-        bot_text = ""
         if is_reply_to_bot:
             bot_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-        if await _propose_correction(message, text, bot_text):
+        else:  # иначе — последний ответ бота в этом чате
+            bot_text = next((m["text"] for m in reversed(context_messages) if m.get("bot")), "")
+        if await _propose_correction(message, text, bot_text, context_messages):
             return
 
     # Проверяем триггер
@@ -894,6 +934,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # Отправляем
     try:
         await send_formatted(chat_id, response, reply_to=message)
+        channel_context.add(chat_id, response, BOT_LABEL, is_bot=True)
         rate_limiter.record_response(chat_id, user_id, cooldown=not force_respond)
         if force_respond:
             rate_limiter.record_direct(chat_id)
@@ -947,6 +988,7 @@ async def _proactive_post(chat_id: int) -> None:
         return
     try:
         await send_formatted(chat_id, post)
+        channel_context.add(chat_id, post, BOT_LABEL, is_bot=True)
     except Exception as e:
         logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
         return

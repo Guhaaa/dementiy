@@ -64,6 +64,60 @@ class SessionFlowTests(unittest.TestCase):
         self.assertEqual(maxim_bot.chat_sessions.get(-5)["turns"], 2)
 
 
+# Фейковый codex, который сохраняет аргументы и prompt рядом с файлом ответа
+RECORDING_CODEX = """#!/bin/sh
+echo "$*" > "$CODEX_LOG.args"
+cat > "$CODEX_LOG.prompt"
+while [ "$1" ]; do [ "$1" = -o ] && out="$2"; shift; done
+echo '{"type":"thread.started","thread_id":"T9"}'
+echo '{"kind": "none"}' > "$out"
+"""
+
+
+class ContextAndLinksTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fake = os.path.join(self.tmp.name, "codex")
+        with open(fake, "w") as f:
+            f.write(RECORDING_CODEX)
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+        maxim_bot.CODEX_BIN = fake
+        maxim_bot.DATA_DIR = self.tmp.name
+        maxim_bot.chat_sessions = ChatSessions(os.path.join(self.tmp.name, "s.json"))
+        os.environ["CODEX_LOG"] = os.path.join(self.tmp.name, "log")
+        self.engine = maxim_bot.MaximResponseEngine()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, kind):
+        with open(os.environ["CODEX_LOG"] + "." + kind) as f:
+            return f.read()
+
+    def test_extractor_sees_recent_conversation(self):
+        ctx = [{"from": "Максим", "text": "я за сборку из исходников"},
+               {"from": maxim_bot.BOT_LABEL, "text": "Т.е. Gentoo."}]
+        asyncio.run(self.engine.extract_correction("Т.е. Gentoo.", "Учти это", ctx))
+        prompt = self.read("prompt")
+        self.assertIn("[Максим]: я за сборку из исходников", prompt)
+        self.assertIn("[Бот (ты)]: Т.е. Gentoo.", prompt)
+
+    def test_link_enables_web_search(self):
+        asyncio.run(self.engine.generate("Глянь https://t.me/s/chan/1", [], -7))
+        self.assertIn('web_search="live"', self.read("args"))
+        self.assertIn("открой её через web search", self.read("prompt"))
+        asyncio.run(self.engine.generate("без ссылок", [], -8))
+        self.assertIn('web_search="disabled"', self.read("args"))
+
+    def test_session_does_not_resend_bot_messages(self):
+        ctx = [{"from": "Женя", "text": "привет", "date": "2026-11-04T10:00:00"},
+               {"from": maxim_bot.BOT_LABEL, "text": "здорово", "date": "2026-11-04T10:00:01", "bot": True}]
+        asyncio.run(self.engine._generate_session(-9, "как дела?", ctx, ""))
+        prompt = self.read("prompt")
+        self.assertIn("[Женя]: привет", prompt)
+        self.assertNotIn("здорово", prompt)
+
+
 class DirectCapTests(unittest.TestCase):
     def test_direct_replies_are_capped_per_chat(self):
         limiter = maxim_bot.RateLimiter()
