@@ -5,6 +5,7 @@ deepseek.key
 
 # Данные
 xo-banya.json
+result.json
 
 # Python
 __pycache__/

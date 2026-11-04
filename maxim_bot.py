@@ -121,7 +121,7 @@ TOP_INTERLOCUTORS = {
 # Технические ключевые слова
 TECH_KEYWORDS = [
     "llm", "prompt", "промпт", "claude", "gemini", "deepseek", "gpt",
-    "chatgpt", "модель", "нейросет", "агент", "mcp", "rag", "embedding",
+    "chatgpt", "клод", "codex", "кодекс", "модель", "нейросет", "агент", "mcp", "rag", "embedding",
     "контекст", "context", "токен", "token", "ai", "ии", "чат", "chat",
     "код", "python", "питон", "c++", "си++", "gstreamer", "pipewire",
     "linux", "wayland", "компилят", "ассемблер", "микроконтроллер",
