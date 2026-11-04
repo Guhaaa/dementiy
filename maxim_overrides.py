@@ -1,4 +1,4 @@
-"""Поправки владельца к поведению бота: правила и примеры «как надо».
+"""Поправки Максима к поведению бота: правила и примеры «как надо».
 
 Хранятся в JSON-файле (DATA_DIR/overrides.json) и переживают перезапуск.
 Попадают в системный промпт выше стилевых подсказок, но ниже правил
@@ -9,11 +9,38 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 
 MAX_RULES = 30
 MAX_EXAMPLES = 10
 MAX_TEXT = 500
+
+
+# Промпт агента, который ищет поправку в реплике Максима боту
+EXTRACT_PROMPT = """Ты помогаешь настраивать бота, который пишет в групповом чате от имени Максима и в его стиле.
+Ниже реплика бота (может быть пустой) и сообщение самого Максима, адресованное боту.
+Реши, говорит ли Максим, как боту себя вести или как надо было ответить. Обычный разговор, шутка или вопрос по теме — это не поправка.
+
+Верни только JSON одной строкой, без пояснений:
+{"kind": "none"} — поправки нет;
+{"kind": "rule", "text": "..."} — общее указание боту; сформулируй его коротко, в повелительном наклонении, до 200 символов;
+{"kind": "example", "text": "..."} — Максим даёт конкретную формулировку, как надо было ответить вместо реплики бота; верни эту формулировку."""
+
+
+def parse_correction(raw: str) -> tuple[str, str] | None:
+    """Ответ агента → ("rule" | "example", текст) или None."""
+    match = re.search(r"\{.*\}", raw, re.S)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    kind, text = data.get("kind"), str(data.get("text") or "").strip()
+    if kind not in {"rule", "example"} or not text:
+        return None
+    return kind, text[:MAX_TEXT]
 
 
 class Overrides:
@@ -53,30 +80,6 @@ class Overrides:
         del self.examples[:-MAX_EXAMPLES]
         self._save()
         return len(self.examples)
-
-    def remove_rule(self, number: int) -> str | None:
-        if not 1 <= number <= len(self.rules):
-            return None
-        removed = self.rules.pop(number - 1)
-        self._save()
-        return removed
-
-    def remove_example(self, number: int) -> dict | None:
-        if not 1 <= number <= len(self.examples):
-            return None
-        removed = self.examples.pop(number - 1)
-        self._save()
-        return removed
-
-    def listing(self) -> str:
-        lines = ["Правила:"]
-        lines += [f"{i}. {r}" for i, r in enumerate(self.rules, 1)] or ["—"]
-        lines.append("\nПримеры «как надо»:")
-        lines += [
-            f"{i}. Было: {e['bot'][:80]}\n   Надо: {e['better']}"
-            for i, e in enumerate(self.examples, 1)
-        ] or ["—"]
-        return "\n".join(lines)
 
     def prompt_section(self) -> str:
         """Блок для системного промпта; пустая строка, если поправок нет."""

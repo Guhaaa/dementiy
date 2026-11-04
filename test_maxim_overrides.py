@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from maxim_overrides import MAX_RULES, Overrides
+from maxim_overrides import MAX_RULES, Overrides, parse_correction
 from maxim_style import build_system_prompt
 
 
@@ -25,13 +25,18 @@ class OverridesTests(unittest.TestCase):
         self.assertIn("- не шути про Марсель", again.prompt_section())
         self.assertIn("Надо: «Т.е. ты про context window?»", again.prompt_section())
 
-    def test_remove_by_number(self):
-        o = Overrides(self.path)
-        o.add_rule("a")
-        o.add_rule("b")
-        self.assertIsNone(o.remove_rule(3))
-        self.assertEqual(o.remove_rule(1), "a")
-        self.assertEqual(Overrides(self.path).rules, ["b"])
+    def test_parse_correction(self):
+        self.assertEqual(parse_correction('{"kind": "none"}'), None)
+        self.assertEqual(parse_correction("не JSON"), None)
+        self.assertEqual(parse_correction('{"kind": "rule", "text": ""}'), None)
+        self.assertEqual(
+            parse_correction('Вот: {"kind": "rule", "text": "Не шути про Марсель"}'),
+            ("rule", "Не шути про Марсель"),
+        )
+        self.assertEqual(
+            parse_correction('{"kind": "example", "text": "Т.е. ты про context?"}'),
+            ("example", "Т.е. ты про context?"),
+        )
 
     def test_rules_are_capped(self):
         o = Overrides(self.path)
