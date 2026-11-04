@@ -1,0 +1,8 @@
+.git
+.env
+venv/
+logs/
+__pycache__/
+*.json
+*.key
+bot_key.txt

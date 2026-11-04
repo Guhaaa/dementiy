@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    image: maxim-bot
+    env_file: .env
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-codex}
+    volumes:
+      # Вход Codex по подписке ChatGPT: docker compose run --rm bot codex login --device-auth
+      - codex-home:/home/node/.codex
+    # Песочнице codex (bubblewrap) нужны user namespaces. Без этих опций
+    # Docker их запрещает, и `codex exec --sandbox read-only` падает.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    restart: unless-stopped
+
+volumes:
+  codex-home:

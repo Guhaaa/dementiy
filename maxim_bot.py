@@ -5,11 +5,12 @@
 Требования:
     pip install aiogram openai
     # или для Claude: pip install anthropic
+    # или для Codex CLI: npm i -g @openai/codex && codex login
 
 Переменные окружения:
     TELEGRAM_BOT_TOKEN      — токен бота от @BotFather
     OPENAI_API_KEY          — ключ OpenAI (или ANTHROPIC_API_KEY)
-    LLM_PROVIDER            — "openai" или "claude" (по умолчанию openai)
+    LLM_PROVIDER            — "openai", "claude" или "codex" (по умолчанию openai)
     LLM_MODEL               — модель (по умолчанию gpt-4o-mini)
     CHANNEL_IDS             — ID каналов/групп через запятую (например, -100123,-100456).
                             Оставьте пустым чтобы слушать ВСЕ группы, куда бот добавлен.
@@ -17,6 +18,7 @@
 
 import os
 import re
+import tempfile
 import time
 import random
 import asyncio
@@ -39,7 +41,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # для DeepSeek: https://api.deepseek.com
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai | claude
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai | claude | codex
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 # CHANNEL_IDS: список через запятую. Пустая строка = слушать все группы.
 _CHANNEL_IDS_RAW = os.getenv("CHANNEL_IDS", "")
@@ -50,10 +52,19 @@ if _CHANNEL_IDS_RAW.strip():
     except ValueError:
         raise RuntimeError(f"CHANNEL_IDS содержит некорректные значения: {_CHANNEL_IDS_RAW}")
 
-# Rate limiting (отключено для отладки)
-COOLDOWN_SECONDS = 180          # 3 минуты между любыми ответами
-PER_USER_COOLDOWN = 300         # 10 минут между ответами одному человеку
-DAILY_LIMIT = 20             # максимум ответов в сутки
+# Codex CLI (LLM_PROVIDER=codex): вход по подписке ChatGPT через `codex login`
+CODEX_BIN = os.getenv("CODEX_BIN", "codex")
+CODEX_MODEL = os.getenv("CODEX_MODEL", "")  # пусто = модель по умолчанию из Codex
+CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "low")
+CODEX_TIMEOUT = float(os.getenv("CODEX_TIMEOUT", "120"))
+CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "read-only")
+# Секреты бота не передаём в процесс codex
+_CODEX_HIDDEN_ENV = {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
+
+# Rate limiting. Прямые обращения к боту его не проходят.
+COOLDOWN_SECONDS = 180        # 3 минуты между любыми ответами
+PER_USER_COOLDOWN = 300       # 5 минут между ответами одному человеку
+DAILY_LIMIT = 20              # максимум ответов в сутки
 TRIGGER_THRESHOLD = 25        # минимальный score для срабатывания
 
 # Случайность — имитация живого настроения
@@ -72,6 +83,8 @@ if FILM_CUE_COUNT not in (2, 3):
 BOT_AUTO_START = os.getenv("BOT_AUTO_START", "1").lower() not in {"0", "false", "no"}
 REPLY_FORCE_RESPOND = os.getenv("REPLY_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
 MENTION_FORCE_RESPOND = os.getenv("MENTION_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
+# «Дементий» во всех падежах. «Максим»/«Макс» сюда не входят: в чате их несколько.
+DEMENTIY_RE = re.compile(r"(?<![\w@])@?дементи(?:й|я|ю|ем|и)\b", re.IGNORECASE)
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
 
@@ -155,7 +168,7 @@ def detect_trigger(text: str, sender_name: str, sender_id: int) -> TriggerResult
         reasons.append("юмор")
 
     # 4. Прямое обращение к Максиму/Дементию (+30)
-    if re.search(r'(@максим|@дементи(?:й|я|ю|ем|и)|максим\b|макс\b|дементи(?:й|я|ю|ем|и)\b)', text_lower):
+    if re.search(r'(@максим|максим\b|макс\b)', text_lower) or DEMENTIY_RE.search(text):
         score += 30
         reasons.append("обращение")
 
@@ -203,6 +216,13 @@ def detect_trigger(text: str, sender_name: str, sender_id: int) -> TriggerResult
     return TriggerResult(score=score, will_respond=will_respond, reasons=reasons)
 
 
+def is_bot_mentioned(text: str, username: str | None) -> bool:
+    """@username бота в тексте. Telegram не различает регистр в username."""
+    if not username:
+        return False
+    return re.search(rf"@{re.escape(username)}\b", text, re.IGNORECASE) is not None
+
+
 # ---------------------------------------------------------------------------
 # Rate Limiter
 # ---------------------------------------------------------------------------
@@ -239,11 +259,15 @@ class RateLimiter:
 
         return True, "ok"
 
-    def record_response(self, user_id: int):
+    def record_response(self, user_id: int, *, cooldown: bool = True):
+        """cooldown=False — прямое обращение: только счётчик за сутки."""
+        self._reset_daily()
+        self.daily_count += 1
+        if not cooldown:
+            return
         now = time.time()
         self.last_response = now
         self.user_last_response[user_id] = now
-        self.daily_count += 1
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +289,8 @@ class MaximResponseEngine:
                 self._generate = self._generate_claude
             except ImportError:
                 raise RuntimeError("pip install anthropic")
+        elif LLM_PROVIDER == "codex":
+            self._generate = self._generate_codex
         else:
             try:
                 from openai import AsyncOpenAI
@@ -317,6 +343,51 @@ class MaximResponseEngine:
             }],
         )
         return response.content[0].text.strip()
+
+    async def _generate_codex(
+        self, user_message: str, context: list[dict], system_prompt: str
+    ) -> str:
+        """Вызывает `codex exec` в пустом каталоге, в песочнице CODEX_SANDBOX."""
+        context_block = "\n".join(self._context_lines(context)) or "(нет)"
+        prompt = (
+            f"{system_prompt}\n\n"
+            "Ответь одной репликой в чат. Не запускай команды и не читай файлы.\n\n"
+            f"Контекст предыдущих реплик:\n{context_block}\n\n"
+            f"[Последняя реплика, на которую нужно ответить]: {user_message}"
+        )
+        with tempfile.TemporaryDirectory(prefix="maxim-codex-") as workdir:
+            out_file = os.path.join(workdir, "answer.txt")
+            args = [
+                CODEX_BIN, "exec",
+                "--skip-git-repo-check", "--ephemeral",
+                "--sandbox", CODEX_SANDBOX, "--color", "never",
+                "-C", workdir, "-o", out_file,
+                "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            ]
+            if CODEX_MODEL:
+                args += ["-m", CODEX_MODEL]
+            args.append("-")
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env={k: v for k, v in os.environ.items() if k not in _CODEX_HIDDEN_ENV},
+            )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(prompt.encode()), timeout=CODEX_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError(f"codex exec: таймаут {CODEX_TIMEOUT:.0f}с")
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"codex exec rc={proc.returncode}: {stderr.decode(errors='replace')[-300:]}"
+                )
+            with open(out_file, encoding="utf-8") as f:
+                return f.read().strip()
 
     async def generate(self, user_message: str, context: list[dict] | None = None) -> str:
         """Генерирует ответ и изредка предлагает модели одну уместную фразу
@@ -508,11 +579,9 @@ async def _process_message(message: types.Message):
         and message.reply_to_message.from_user is not None
         and message.reply_to_message.from_user.id == BOT_ID
     )
-    # Проверяем, упомянули ли бота по @username
-    is_mentioned = (
-        MENTION_FORCE_RESPOND
-        and BOT_USERNAME is not None
-        and f"@{BOT_USERNAME}" in text
+    # Проверяем, упомянули ли бота по @username или по имени «Дементий»
+    is_mentioned = MENTION_FORCE_RESPOND and (
+        is_bot_mentioned(text, BOT_USERNAME) or bool(DEMENTIY_RE.search(text))
     )
     force_respond = is_reply_to_bot or is_mentioned
 
@@ -546,7 +615,7 @@ async def _process_message(message: types.Message):
 
     # Проверка качества ответа: не отправляем пустые или формальные ответы
     # на слабые триггеры
-    if trigger.score < 30 and len(response) < 10:
+    if not force_respond and trigger.score < 30 and len(response) < 10:
         logger.info(f"[QUALITY] Ответ слишком короткий для слабого триггера, пропускаем")
         return
 
@@ -558,7 +627,7 @@ async def _process_message(message: types.Message):
         # Ответ LLM — обычный текст. Не даём угловым скобкам из C++/HTML
         # превращаться в Telegram entities и ломать отправку.
         await message.reply(response, parse_mode=None)
-        rate_limiter.record_response(user_id)
+        rate_limiter.record_response(user_id, cooldown=not force_respond)
         logger.info(f"[SENT] to={sender} trigger_score={trigger.score} response={response[:100]}")
     except Exception as e:
         logger.error(f"[SEND ERROR] {e}")
