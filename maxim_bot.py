@@ -26,12 +26,14 @@ import logging
 from datetime import datetime
 from dataclasses import dataclass, field
 
-from maxim_overrides import Overrides
+from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
 from maxim_style import build_system_prompt, choose_film_cues, choose_phrase_cue
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
+from aiogram import F
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 
 # ---------------------------------------------------------------------------
@@ -90,7 +92,12 @@ DEMENTIY_RE = re.compile(r"(?<![\w@])@?дементи(?:й|я|ю|ем|и)\b", re
 ADMIN_IDS: set[int] = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
 }
-# Каталог данных (поправки владельца). В Docker — том bot-data.
+# Telegram ID самого Максима: агент разбирает его реплики боту на поправки,
+# и только он утверждает их кнопкой в чате.
+PERSONA_IDS: set[int] = {
+    int(x) for x in os.getenv("PERSONA_IDS", "").replace(" ", "").split(",") if x
+}
+# Каталог данных (поправки Максима). В Docker — том bot-data.
 DATA_DIR = os.getenv("DATA_DIR", "data")
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
@@ -396,6 +403,15 @@ class MaximResponseEngine:
             with open(out_file, encoding="utf-8") as f:
                 return f.read().strip()
 
+    async def extract_correction(self, bot_text: str, persona_text: str) -> tuple[str, str] | None:
+        """Агент: есть ли в реплике Максима поправка к поведению бота."""
+        raw = await self._generate(
+            f"Реплика бота: «{bot_text}»\nСообщение Максима: «{persona_text}»",
+            [],
+            EXTRACT_PROMPT,
+        )
+        return parse_correction(raw)
+
     async def generate(self, user_message: str, context: list[dict] | None = None) -> str:
         """Генерирует ответ и изредка предлагает модели одну уместную фразу
         и/или 2–3 крылатые цитаты из советских фильмов."""
@@ -502,7 +518,7 @@ async def cmd_start(message: types.Message):
     if not await _owner_private(message):
         return
     bot_started = True
-    await message.answer("🤖 Бот Максима запущен. Слушаю канал. Команды: /help")
+    await message.answer("🤖 Бот Максима запущен. Слушаю канал.")
 
 
 @dp.message(Command("stop"))
@@ -548,80 +564,62 @@ async def cmd_debug(message: types.Message):
     )
 
 
-HELP_TEXT = (
-    "Команды владельца (в личке):\n"
-    "/rule <текст> — добавить правило поведения\n"
-    "/rules — правила и примеры\n"
-    "/unrule <N> — удалить правило\n"
-    "/unbad <N> — удалить пример\n"
-    "/start, /stop, /status, /debug\n\n"
-    "/bad <как надо> — reply на неудачный ответ бота, в группе или в личке."
-)
+# Предложенные агентом поправки, ждут кнопки Максима: id → (kind, text, bot_text)
+pending_corrections: dict[int, tuple[str, str, str]] = {}
+_next_correction_id = 0
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    if not await _owner_private(message):
+async def _propose_correction(message: types.Message, text: str, bot_text: str) -> bool:
+    """Если в реплике Максима есть поправка — предлагает её с кнопками. True, если предложил."""
+    global _next_correction_id
+    try:
+        correction = await response_engine.extract_correction(bot_text, text)
+    except Exception as e:
+        logger.error(f"[CORRECTION ERROR] {e}")
+        return False
+    if correction is None:
+        return False
+    kind, correction_text = correction
+    _next_correction_id += 1
+    cid = _next_correction_id
+    pending_corrections[cid] = (kind, correction_text, bot_text)
+    for old in list(pending_corrections)[:-50]:
+        del pending_corrections[old]
+    label = "Правило" if kind == "rule" else "Так надо было ответить"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Учесть", callback_data=f"ov:yes:{cid}"),
+        InlineKeyboardButton(text="Нет", callback_data=f"ov:no:{cid}"),
+    ]])
+    await message.reply(
+        f"{label}: «{correction_text}». Учесть?", reply_markup=keyboard, parse_mode=None
+    )
+    logger.info(f"[CORRECTION] proposed #{cid} {kind}: {correction_text!r}")
+    return True
+
+
+@dp.callback_query(F.data.startswith("ov:"))
+async def on_correction_button(call: CallbackQuery):
+    if call.from_user.id not in PERSONA_IDS:
+        await call.answer("Утверждает только Максим.")
         return
-    await message.answer(HELP_TEXT, parse_mode=None)
-
-
-@dp.message(Command("rule"))
-async def cmd_rule(message: types.Message, command: CommandObject):
-    if not await _owner_private(message):
+    _, action, cid = call.data.split(":")
+    item = pending_corrections.pop(int(cid), None)
+    if item is None:
+        await call.answer("Уже неактуально.")
+        await call.message.edit_reply_markup(reply_markup=None)
         return
-    if not command.args:
-        await message.answer("Формат: /rule не шути про Марсель")
-        return
-    number = overrides.add_rule(command.args)
-    logger.info(f"[OVERRIDE] rule #{number} from user_id={message.from_user.id}: {command.args!r}")
-    await message.answer(f"Правило {number} добавлено.")
-
-
-@dp.message(Command("rules"))
-async def cmd_rules(message: types.Message):
-    if not await _owner_private(message):
-        return
-    await message.answer(overrides.listing(), parse_mode=None)
-
-
-async def _remove(message: types.Message, args: str | None, remove, done: str):
-    if not await _owner_private(message):
-        return
-    if not args or not args.strip().isdigit():
-        await message.answer("Формат: номер из /rules, например 2")
-        return
-    removed = remove(int(args))
-    await message.answer(done.format(args.strip()) if removed else "Нет такого номера.")
-
-
-@dp.message(Command("unrule"))
-async def cmd_unrule(message: types.Message, command: CommandObject):
-    await _remove(message, command.args, overrides.remove_rule, "Правило {} удалено.")
-
-
-@dp.message(Command("unbad"))
-async def cmd_unbad(message: types.Message, command: CommandObject):
-    await _remove(message, command.args, overrides.remove_example, "Пример {} удалён.")
-
-
-@dp.message(Command("bad"))
-async def cmd_bad(message: types.Message, command: CommandObject):
-    """Reply на ответ бота: «так было плохо, надо вот так». Работает и в группе."""
-    if not is_owner(message):
-        return
-    target = message.reply_to_message
-    if (
-        target is None
-        or target.from_user is None
-        or target.from_user.id != BOT_ID
-        or not command.args
-    ):
-        await message.reply("Сделайте reply на ответ бота: /bad как надо было ответить")
-        return
-    number = overrides.add_example(target.text or target.caption or "", command.args)
-    logger.info(f"[OVERRIDE] example #{number} from user_id={message.from_user.id}")
-    await message.reply("Учту.")
+    kind, text, bot_text = item
+    if action == "yes":
+        if kind == "rule":
+            overrides.add_rule(text)
+        else:
+            overrides.add_example(bot_text, text)
+        logger.info(f"[CORRECTION] accepted #{cid}")
+        await call.message.edit_text(f"Учёл: «{text}»", parse_mode=None)
+    else:
+        logger.info(f"[CORRECTION] rejected #{cid}")
+        await call.message.delete()
+    await call.answer()
 
 
 async def _process_message(message: types.Message, *, private: bool = False):
@@ -679,6 +677,14 @@ async def _process_message(message: types.Message, *, private: bool = False):
         is_bot_mentioned(text, BOT_USERNAME) or bool(DEMENTIY_RE.search(text))
     )
     force_respond = private or is_reply_to_bot or is_mentioned
+
+    # Максим обращается к боту: сначала агент ищет в реплике поправку
+    if user_id in PERSONA_IDS and (is_reply_to_bot or is_mentioned):
+        bot_text = ""
+        if is_reply_to_bot:
+            bot_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        if await _propose_correction(message, text, bot_text):
+            return
 
     # Проверяем триггер
     trigger = detect_trigger(text, sender, user_id)
