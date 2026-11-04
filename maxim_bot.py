@@ -85,6 +85,10 @@ REPLY_FORCE_RESPOND = os.getenv("REPLY_FORCE_RESPOND", "1").lower() not in {"0",
 MENTION_FORCE_RESPOND = os.getenv("MENTION_FORCE_RESPOND", "1").lower() not in {"0", "false", "no"}
 # «Дементий» во всех падежах. «Максим»/«Макс» сюда не входят: в чате их несколько.
 DEMENTIY_RE = re.compile(r"(?<![\w@])@?дементи(?:й|я|ю|ем|и)\b", re.IGNORECASE)
+# Владельцы бота: только они управляют командами и говорят с ботом в личке
+ADMIN_IDS: set[int] = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
+}
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
 
@@ -473,11 +477,26 @@ channel_context = ChannelContext()
 bot_started = BOT_AUTO_START
 
 
+def is_owner(message: types.Message) -> bool:
+    return message.from_user is not None and message.from_user.id in ADMIN_IDS
+
+
+async def _owner_private(message: types.Message) -> bool:
+    """Команды управления — только владельцу и только в личке."""
+    if message.chat.type != "private":
+        await message.reply("Команды управления — только в личку.")
+        return False
+    if not is_owner(message):
+        user_id = message.from_user.id if message.from_user else 0
+        logger.info(f"[SKIP] команда не от владельца: user_id={user_id}")
+        return False
+    return True
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     global bot_started
-    if message.chat.type != "private":
-        await message.reply("Команды управления — только в личку.")
+    if not await _owner_private(message):
         return
     bot_started = True
     await message.answer("🤖 Бот Максима запущен. Слушаю канал.")
@@ -486,8 +505,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     global bot_started
-    if message.chat.type != "private":
-        await message.reply("Команды управления — только в личку.")
+    if not await _owner_private(message):
         return
     bot_started = False
     await message.answer("🔴 Бот Максима остановлен.")
@@ -495,8 +513,7 @@ async def cmd_stop(message: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    if message.chat.type != "private":
-        await message.reply("Команды управления — только в личку.")
+    if not await _owner_private(message):
         return
     try:
         await message.answer(
@@ -512,8 +529,7 @@ async def cmd_status(message: types.Message):
 @dp.message(Command("debug"))
 async def cmd_debug(message: types.Message):
     """Показывает, сработал бы триггер на последнее сообщение."""
-    if message.chat.type != "private":
-        await message.reply("Команды управления — только в личку.")
+    if not await _owner_private(message):
         return
     if channel_context.last_message is None:
         await message.answer("Нет сохранённых сообщений.")
@@ -529,7 +545,7 @@ async def cmd_debug(message: types.Message):
     )
 
 
-async def _process_message(message: types.Message):
+async def _process_message(message: types.Message, *, private: bool = False):
     """Общая логика обработки сообщения (канал или группа)."""
     global bot_started
 
@@ -561,7 +577,7 @@ async def _process_message(message: types.Message):
             return
 
     # Белый список каналов/групп (если задан)
-    if CHANNEL_IDS and chat_id not in CHANNEL_IDS:
+    if not private and CHANNEL_IDS and chat_id not in CHANNEL_IDS:
         logger.info(f"[SKIP] чат {chat_id} не в CHANNEL_IDS (разрешены: {CHANNEL_IDS})")
         return
 
@@ -583,13 +599,15 @@ async def _process_message(message: types.Message):
     is_mentioned = MENTION_FORCE_RESPOND and (
         is_bot_mentioned(text, BOT_USERNAME) or bool(DEMENTIY_RE.search(text))
     )
-    force_respond = is_reply_to_bot or is_mentioned
+    force_respond = private or is_reply_to_bot or is_mentioned
 
     # Проверяем триггер
     trigger = detect_trigger(text, sender, user_id)
     if force_respond:
         trigger.score = max(trigger.score, TRIGGER_THRESHOLD + 1)
         trigger.will_respond = True
+        if private:
+            trigger.reasons.insert(0, "личка владельца")
         if is_mentioned:
             trigger.reasons.insert(0, "упоминание бота")
         if is_reply_to_bot:
@@ -642,11 +660,15 @@ async def handle_channel_post(message: types.Message):
 
 @dp.message()
 async def handle_group_message(message: types.Message):
-    """Обрабатывает не-командные сообщения в группах/супергруппах.
+    """Обрабатывает не-командные сообщения в группах и в личке владельца.
     Срабатывает только после того, как все Command-хендлеры не подошли."""
-    # Не обрабатываем личные сообщения (чтобы не мешать /start /status /debug)
+    # В личке бот говорит только с владельцем (ADMIN_IDS)
     if message.chat.type == "private":
-        logger.info(f"[HANDLER] личное сообщение пропущено: {message.text!r}")
+        if not is_owner(message):
+            user_id = message.from_user.id if message.from_user else 0
+            logger.info(f"[HANDLER] личка не от владельца: user_id={user_id}")
+            return
+        await _process_message(message, private=True)
         return
     logger.info(f"[HANDLER] group_message: chat={message.chat.type} text={message.text!r}")
     await _process_message(message)

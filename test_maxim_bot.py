@@ -2,6 +2,7 @@ import asyncio
 import os
 import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:TEST")
@@ -30,6 +31,17 @@ class DirectAddressTests(unittest.TestCase):
         self.assertEqual(limiter.daily_count, 1)
         limiter.record_response(1)
         self.assertFalse(limiter.can_respond(1)[0])
+
+
+class OwnerTests(unittest.TestCase):
+    def test_only_admin_ids_are_owners(self):
+        maxim_bot.ADMIN_IDS = {42}
+        owner = SimpleNamespace(from_user=SimpleNamespace(id=42))
+        stranger = SimpleNamespace(from_user=SimpleNamespace(id=7))
+        anonymous = SimpleNamespace(from_user=None)
+        self.assertTrue(maxim_bot.is_owner(owner))
+        self.assertFalse(maxim_bot.is_owner(stranger))
+        self.assertFalse(maxim_bot.is_owner(anonymous))
 
 
 class CodexProviderTests(unittest.TestCase):
