@@ -30,7 +30,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
-from maxim_overrides import EXTRACT_PROMPT, Overrides, parse_correction
+from maxim_overrides import EXTRACT_PROMPT, Correction, Overrides, PendingCorrections, parse_correction
 from maxim_format import md_to_telegram_html
 from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
 from maxim_sessions import SESSION_PREAMBLE, ChatSessions, build_turn, overrides_hash
@@ -584,23 +584,30 @@ class MaximResponseEngine:
 
     async def extract_correction(
         self, bot_text: str, persona_text: str, context: list[dict] | None = None
-    ) -> tuple[str, str] | None:
+    ) -> Correction | None:
         """Агент: есть ли в реплике Максима поправка к поведению бота.
 
         context — последние сообщения чата вместе с ответами бота: без них
         «учти это» непонятно, к чему относится."""
         history = "\n".join(f"[{m['from']}]: {m['text'][:600]}" for m in (context or [])[-8:])
         raw = await self._generate(
+            f"Сохранённые поправки:\n{overrides.numbered_rules()}\n\n"
             f"Недавний разговор:\n{history or '(нет)'}\n\n"
             f"Реплика бота, на которую отвечает Максим: «{bot_text}»\n"
             f"Сообщение Максима: «{persona_text}»",
             [],
             EXTRACT_PROMPT,
         )
-        return parse_correction(raw)
+        correction = parse_correction(raw, overrides.rules)
+        logger.info(f"[CORRECTION] агент: {correction or 'поправки нет'}")
+        return correction
 
     async def generate(
-        self, user_message: str, context: list[dict] | None = None, chat_id: int | None = None
+        self,
+        user_message: str,
+        context: list[dict] | None = None,
+        chat_id: int | None = None,
+        extra_hint: str = "",
     ) -> str:
         # Ссылка в сообщении — Codex может открыть её через web search
         web_search = LLM_PROVIDER == "codex" and bool(URL_RE.search(user_message))
@@ -633,6 +640,8 @@ class MaximResponseEngine:
                 [q.text[:50] for q in film_cues],
             )
         hints = build_hints(cue, film_cues)
+        if extra_hint:
+            hints += f"\n\n{extra_hint}"
         if web_search:
             hints += "\n\nВ реплике есть ссылка. Если для ответа нужно её содержимое — открой её."
         if LLM_PROVIDER == "codex" and chat_id is not None:
@@ -798,15 +807,23 @@ async def send_formatted(chat_id: int, text: str, reply_to: types.Message | None
 
 
 # Предложенные агентом поправки, ждут кнопки Максима: id → (kind, text, bot_text)
-pending_corrections: dict[int, tuple[str, str, str]] = {}
-_next_correction_id = 0
+pending_corrections = PendingCorrections(os.path.join(DATA_DIR, "pending_corrections.json"))
+
+
+def correction_label(c: Correction) -> str:
+    if c.kind == "forget":
+        return f"Забыть поправку: «{c.replaces}». Учесть?"
+    if c.kind == "example":
+        return f"Так надо было ответить: «{c.text}». Учесть?"
+    if c.replaces:
+        return f"Заменить поправку «{c.replaces}» на «{c.text}». Учесть?"
+    return f"Правило: «{c.text}». Учесть?"
 
 
 async def _propose_correction(
     message: types.Message, text: str, bot_text: str, context: list[dict]
 ) -> bool:
     """Если в реплике Максима есть поправка — предлагает её с кнопками. True, если предложил."""
-    global _next_correction_id
     try:
         correction = await response_engine.extract_correction(bot_text, text, context)
     except Exception as e:
@@ -814,21 +831,13 @@ async def _propose_correction(
         return False
     if correction is None:
         return False
-    kind, correction_text = correction
-    _next_correction_id += 1
-    cid = _next_correction_id
-    pending_corrections[cid] = (kind, correction_text, bot_text)
-    for old in list(pending_corrections)[:-50]:
-        del pending_corrections[old]
-    label = "Правило" if kind == "rule" else "Так надо было ответить"
+    cid = pending_corrections.add(correction, bot_text)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Учесть", callback_data=f"ov:yes:{cid}"),
         InlineKeyboardButton(text="Нет", callback_data=f"ov:no:{cid}"),
     ]])
-    await message.reply(
-        f"{label}: «{correction_text}». Учесть?", reply_markup=keyboard, parse_mode=None
-    )
-    logger.info(f"[CORRECTION] proposed #{cid} {kind}: {correction_text!r}")
+    await message.reply(correction_label(correction), reply_markup=keyboard, parse_mode=None)
+    logger.info(f"[CORRECTION] proposed #{cid}: {correction}")
     return True
 
 
@@ -838,19 +847,16 @@ async def on_correction_button(call: CallbackQuery):
         await call.answer("Утверждает только Максим.")
         return
     _, action, cid = call.data.split(":")
-    item = pending_corrections.pop(int(cid), None)
+    item = pending_corrections.pop(cid)
     if item is None:
         await call.answer("Уже неактуально.")
         await call.message.edit_reply_markup(reply_markup=None)
         return
-    kind, text, bot_text = item
+    correction, bot_text = item
     if action == "yes":
-        if kind == "rule":
-            overrides.add_rule(text)
-        else:
-            overrides.add_example(bot_text, text)
+        done = overrides.apply(correction, bot_text)
         logger.info(f"[CORRECTION] accepted #{cid}")
-        await call.message.edit_text(f"Учёл: «{text}»", parse_mode=None)
+        await call.message.edit_text(done, parse_mode=None)
     else:
         logger.info(f"[CORRECTION] rejected #{cid}")
         await call.message.delete()
@@ -935,14 +941,24 @@ async def _process_message(message: types.Message, *, private: bool = False):
     )
     force_respond = private or is_reply_to_bot or is_mentioned
 
-    # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку
+    # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
+    llm_text = "\n".join([text, *(u for u in hidden_links(message) if u not in text)])
+    if quoted := reply_block(message):
+        llm_text = f"{quoted}\n{llm_text}"
+
+    # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку.
+    # Поправка не отменяет ответ: в той же реплике может быть и вопрос.
+    extra_hint = ""
     if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):
         if is_reply_to_bot:
             bot_text = message.reply_to_message.text or message.reply_to_message.caption or ""
         else:  # иначе — последний ответ бота в этом чате
             bot_text = next((m["text"] for m in reversed(context_messages) if m.get("bot")), "")
-        if await _propose_correction(message, text, bot_text, context_messages):
-            return
+        if await _propose_correction(message, llm_text, bot_text, context_messages):
+            extra_hint = (
+                "Поправку из этой реплики Максим утвердит кнопками, её не обсуждай. "
+                "Если кроме поправки в реплике нет вопроса или темы для ответа — верни SKIP."
+            )
 
     # Проверяем триггер
     trigger = detect_trigger(text, sender, user_id)
@@ -970,14 +986,9 @@ async def _process_message(message: types.Message, *, private: bool = False):
             logger.info(f"[RATE-LIMIT] {reason} for {sender}")
             return
 
-    # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
-    llm_text = "\n".join([text, *(u for u in hidden_links(message) if u not in text)])
-    if quoted := reply_block(message):
-        llm_text = f"{quoted}\n{llm_text}"
-
     # Генерируем ответ
     try:
-        response = await response_engine.generate(llm_text, context_messages, chat_id)
+        response = await response_engine.generate(llm_text, context_messages, chat_id, extra_hint)
     except Exception as e:
         logger.error(f"[LLM ERROR] {e}")
         return

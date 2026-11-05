@@ -101,6 +101,7 @@ class ContextAndLinksTests(unittest.TestCase):
         prompt = self.read("prompt")
         self.assertIn("[Максим]: я за сборку из исходников", prompt)
         self.assertIn("[Бот (ты)]: Т.е. Gentoo.", prompt)
+        self.assertIn("Сохранённые поправки:", prompt)
 
     def test_link_enables_web_search(self):
         asyncio.run(self.engine.generate("Глянь https://t.me/s/chan/1", [], -7))
