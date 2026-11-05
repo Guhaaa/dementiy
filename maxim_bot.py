@@ -857,6 +857,28 @@ async def on_correction_button(call: CallbackQuery):
     await call.answer()
 
 
+def hidden_links(msg) -> list[str]:
+    """Ссылки, спрятанные под текстом (entity text_link): в самом тексте их нет."""
+    return [e.url for e in (msg.entities or msg.caption_entities or [])
+            if e.type == "text_link" and e.url]
+
+
+def reply_block(message) -> str:
+    """Сообщение, на которое ответили: автор, текст (или выделенная цитата) и ссылки."""
+    r = message.reply_to_message
+    # В темах форума каждое сообщение — «ответ» на начало темы
+    if r is None or (message.is_topic_message and r.message_id == message.message_thread_id):
+        return ""
+    if r.from_user and r.from_user.id == BOT_ID:
+        who = BOT_LABEL
+    else:
+        who = r.author_signature or (r.from_user.full_name if r.from_user else "Unknown")
+    quote = message.quote.text if message.quote else ""
+    body = (quote or r.text or r.caption or "[без текста]")[:1500]
+    links = [u for u in hidden_links(r) if u not in body]
+    return "\n".join([f"[В ответ на сообщение {who}]: {body}", *links])
+
+
 async def _process_message(message: types.Message, *, private: bool = False):
     """Общая логика обработки сообщения (канал или группа)."""
     global bot_started
@@ -948,9 +970,14 @@ async def _process_message(message: types.Message, *, private: bool = False):
             logger.info(f"[RATE-LIMIT] {reason} for {sender}")
             return
 
+    # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
+    llm_text = "\n".join([text, *(u for u in hidden_links(message) if u not in text)])
+    if quoted := reply_block(message):
+        llm_text = f"{quoted}\n{llm_text}"
+
     # Генерируем ответ
     try:
-        response = await response_engine.generate(text, context_messages, chat_id)
+        response = await response_engine.generate(llm_text, context_messages, chat_id)
     except Exception as e:
         logger.error(f"[LLM ERROR] {e}")
         return

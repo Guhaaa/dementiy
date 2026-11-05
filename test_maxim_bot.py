@@ -54,6 +54,31 @@ class OwnerTests(unittest.TestCase):
         self.assertFalse(maxim_bot.is_owner(anonymous))
 
 
+def _msg(**kw):
+    base = dict(reply_to_message=None, quote=None, entities=None, caption_entities=None,
+                text=None, caption=None, from_user=None, author_signature=None,
+                is_topic_message=False, message_thread_id=None, message_id=1)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+class ReplyBlockTests(unittest.TestCase):
+    def test_reply_carries_author_text_and_hidden_links(self):
+        link = SimpleNamespace(type="text_link", url="https://smart-lab.ru/x")
+        original = _msg(message_id=5, text="9 моделей мышления", entities=[link],
+                        from_user=SimpleNamespace(id=7, full_name="Roman"))
+        block = maxim_bot.reply_block(_msg(text="посмотри", reply_to_message=original))
+        self.assertIn("[В ответ на сообщение Roman]: 9 моделей мышления", block)
+        self.assertIn("https://smart-lab.ru/x", block)
+
+    def test_selected_quote_wins_and_topic_root_is_ignored(self):
+        original = _msg(message_id=5, text="длинный текст", from_user=SimpleNamespace(id=7, full_name="R"))
+        quoted = _msg(reply_to_message=original, quote=SimpleNamespace(text="кусок"))
+        self.assertIn("]: кусок", maxim_bot.reply_block(quoted))
+        topic = _msg(reply_to_message=original, is_topic_message=True, message_thread_id=5)
+        self.assertEqual(maxim_bot.reply_block(topic), "")
+
+
 class CodexProviderTests(unittest.TestCase):
     def test_codex_exec_answer_is_read_from_output_file(self):
         with tempfile.TemporaryDirectory() as tmp:
