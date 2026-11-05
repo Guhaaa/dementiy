@@ -70,6 +70,25 @@ class CodexProviderTests(unittest.TestCase):
             answer = asyncio.run(engine._generate_codex("как дела?", [], "system"))
         self.assertEqual(answer, "Т.е. работает.")
 
+    def test_playwright_mcp_only_with_web_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "codex")
+            with open(fake, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'all="$*"; while [ "$1" ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
+                    'case "$all" in *mcp_servers.playwright.command*) m=mcp;; *) m=none;; esac\n'
+                    'grep -q "browser_navigate" && p=hint || p=nohint\n'
+                    'echo "$m $p" > "$out"\n'
+                )
+            os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+            maxim_bot.CODEX_BIN = fake
+            engine = maxim_bot.MaximResponseEngine()
+            with_web = asyncio.run(engine._codex_exec("x", web_search=True))
+            without = asyncio.run(engine._codex_exec("x"))
+        self.assertEqual(with_web, "mcp hint")
+        self.assertEqual(without, "none nohint")
+
 
 if __name__ == "__main__":
     unittest.main()

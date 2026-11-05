@@ -105,7 +105,8 @@ class ContextAndLinksTests(unittest.TestCase):
     def test_link_enables_web_search(self):
         asyncio.run(self.engine.generate("Глянь https://t.me/s/chan/1", [], -7))
         self.assertIn('web_search="live"', self.read("args"))
-        self.assertIn("открой её через web search", self.read("prompt"))
+        self.assertIn("открой её", self.read("prompt"))
+        self.assertIn("browser_navigate", self.read("prompt"))
         asyncio.run(self.engine.generate("без ссылок", [], -8))
         self.assertIn('web_search="disabled"', self.read("args"))
 
