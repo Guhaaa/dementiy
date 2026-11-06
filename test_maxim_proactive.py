@@ -38,6 +38,11 @@ class PostTests(unittest.TestCase):
         self.assertIn("Не повторяй", build_task(["про Codex"]))
         self.assertNotIn("Не повторяй", build_task([]))
 
+    def test_task_uses_chat_topics(self):
+        self.assertIn("Тема должна быть интересна многим", build_task([]))
+        self.assertIn("выбирай из них: баня, книги.", build_task([], "баня, книги"))
+        self.assertNotIn("заданы владельцем", build_task([]))
+
     def test_state_per_chat_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "proactive.json")

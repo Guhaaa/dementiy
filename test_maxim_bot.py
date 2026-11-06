@@ -79,6 +79,24 @@ class ReplyBlockTests(unittest.TestCase):
         self.assertEqual(maxim_bot.reply_block(topic), "")
 
 
+class MediaAndBoostTests(unittest.TestCase):
+    def test_unseen_media_is_marked_in_reply(self):
+        photo = _msg(message_id=5, photo=[object()], from_user=SimpleNamespace(id=7, full_name="R"))
+        self.assertIn("[фото, ты его не видишь]", maxim_bot.reply_block(_msg(reply_to_message=photo)))
+        self.assertEqual(maxim_bot.media_kind(_msg(text="просто текст")), "")
+
+    def test_user_boost_shifts_score(self):
+        names = ("USER_TRIGGER_BOOST", "RANDOM_JITTER", "RANDOM_LONGSHOT", "RANDOM_SILENCE")
+        saved = {n: getattr(maxim_bot, n) for n in names}
+        self.addCleanup(lambda: [setattr(maxim_bot, n, v) for n, v in saved.items()])
+        maxim_bot.USER_TRIGGER_BOOST = {977070655: 10}
+        maxim_bot.RANDOM_JITTER = maxim_bot.RANDOM_LONGSHOT = maxim_bot.RANDOM_SILENCE = 0
+        boosted = maxim_bot.detect_trigger("ок", "Hawaiian Boy", 977070655)
+        plain = maxim_bot.detect_trigger("ок", "Кто-то", 1)
+        self.assertIn("оверрайд +10", boosted.reasons)
+        self.assertEqual(boosted.score - plain.score, 10)
+
+
 class CodexProviderTests(unittest.TestCase):
     def test_codex_exec_answer_is_read_from_output_file(self):
         with tempfile.TemporaryDirectory() as tmp:

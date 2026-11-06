@@ -91,6 +91,11 @@ DAILY_LIMIT = 20              # максимум ответов в группе 
 # Потолок прямых ответов в одной группе за 10 минут (защита от спама)
 DIRECT_MAX_PER_10MIN = int(os.getenv("DIRECT_MAX_PER_10MIN", "6"))
 TRIGGER_THRESHOLD = 25        # минимальный score для срабатывания
+# Оверрайды по людям: «user_id:+N,user_id:-N» — сдвиг score их сообщений
+USER_TRIGGER_BOOST: dict[int, int] = {
+    int(uid): int(delta)
+    for uid, delta in (x.split(":") for x in os.getenv("USER_TRIGGER_BOOST", "").replace(" ", "").split(",") if x)
+}
 
 # Случайность — имитация живого настроения
 RANDOM_JITTER = 10            # ± разброс score (0 = отключено)
@@ -131,6 +136,10 @@ PROACTIVE_MAX_HOURS = float(os.getenv("PROACTIVE_MAX_HOURS", "48"))
 _start, _end = os.getenv("PROACTIVE_HOURS", "10-22").split("-")
 PROACTIVE_START_HOUR, PROACTIVE_END_HOUR = int(_start), int(_end)
 PROACTIVE_TZ = ZoneInfo(os.getenv("PROACTIVE_TZ", "Europe/Paris"))
+# Темы постов по чатам, JSON: {"-100…": "баня, книги, …"}. Чата нет — тема по истории чата
+PROACTIVE_TOPICS: dict[int, str] = {
+    int(k): v for k, v in json.loads(os.getenv("PROACTIVE_TOPICS") or "{}").items()
+}
 # Каталог данных (поправки Максима). В Docker — том bot-data.
 DATA_DIR = os.getenv("DATA_DIR", "data")
 BOT_ID: int | None = None  # заполняется в main() через get_me()
@@ -236,7 +245,12 @@ def detect_trigger(text: str, sender_name: str, sender_id: int) -> TriggerResult
         score += 10
         reasons.append("топ-собеседник")
 
-    # 8. Базовая реплика (+5) — фон
+    # 8. Оверрайд для конкретного человека
+    if boost := USER_TRIGGER_BOOST.get(sender_id):
+        score += boost
+        reasons.append(f"оверрайд {boost:+d}")
+
+    # 9. Базовая реплика (+5) — фон
     score += 5
 
     # ---- Факторы случайности ----
@@ -578,7 +592,7 @@ class MaximResponseEngine:
         """В сессии этого чата Codex ищет в интернете находку и пишет о ней."""
         raw = await self._generate_session(
             chat_id, None, channel_context.get_recent(chat_id, 30), "",
-            task=build_task(recent), web_search=True,
+            task=build_task(recent, PROACTIVE_TOPICS.get(chat_id, "")), web_search=True,
         )
         return clean_post(raw)
 
@@ -869,6 +883,17 @@ def hidden_links(msg) -> list[str]:
             if e.type == "text_link" and e.url]
 
 
+_MEDIA_KINDS = {
+    "photo": "фото", "video": "видео", "animation": "гифка", "sticker": "стикер",
+    "document": "файл", "voice": "голосовое", "video_note": "кружок", "audio": "аудио",
+}
+
+
+def media_kind(msg) -> str:
+    """Что приложено к сообщению и чего модель не видит: «фото», «видео»… или ""."""
+    return next((name for attr, name in _MEDIA_KINDS.items() if getattr(msg, attr, None)), "")
+
+
 def reply_block(message) -> str:
     """Сообщение, на которое ответили: автор, текст (или выделенная цитата) и ссылки."""
     r = message.reply_to_message
@@ -880,7 +905,10 @@ def reply_block(message) -> str:
     else:
         who = r.author_signature or (r.from_user.full_name if r.from_user else "Unknown")
     quote = message.quote.text if message.quote else ""
-    body = (quote or r.text or r.caption or "[без текста]")[:1500]
+    body = (quote or r.text or r.caption or "")[:1500]
+    if kind := media_kind(r):
+        body = f"[{kind}, ты его не видишь] {body}".strip()
+    body = body or "[без текста]"
     links = [u for u in hidden_links(r) if u not in body]
     return "\n".join([f"[В ответ на сообщение {who}]: {body}", *links])
 
@@ -943,19 +971,26 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
     llm_text = "\n".join([text, *(u for u in hidden_links(message) if u not in text)])
+    if kind := media_kind(message):
+        llm_text = f"[к сообщению приложено: {kind}, ты его не видишь]\n{llm_text}"
     if quoted := reply_block(message):
         llm_text = f"{quoted}\n{llm_text}"
 
     # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку.
     # Поправка не отменяет ответ: в той же реплике может быть и вопрос.
-    extra_hint = ""
+    hints = []
+    if media_kind(message) or (message.reply_to_message and media_kind(message.reply_to_message)):
+        hints.append(
+            "Ты не видишь фото, видео и файлы. Если реплика о них и без них ответить нельзя — "
+            "верни SKIP, не гадай и не переспрашивай, что там."
+        )
     if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):
         if is_reply_to_bot:
             bot_text = message.reply_to_message.text or message.reply_to_message.caption or ""
         else:  # иначе — последний ответ бота в этом чате
             bot_text = next((m["text"] for m in reversed(context_messages) if m.get("bot")), "")
         if await _propose_correction(message, llm_text, bot_text, context_messages):
-            extra_hint = (
+            hints.append(
                 "Поправку из этой реплики Максим утвердит кнопками, её не обсуждай. "
                 "Если кроме поправки в реплике нет вопроса или темы для ответа — верни SKIP."
             )
@@ -988,7 +1023,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Генерируем ответ
     try:
-        response = await response_engine.generate(llm_text, context_messages, chat_id, extra_hint)
+        response = await response_engine.generate(llm_text, context_messages, chat_id, "\n".join(hints))
     except Exception as e:
         logger.error(f"[LLM ERROR] {e}")
         return
