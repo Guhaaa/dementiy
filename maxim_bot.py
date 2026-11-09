@@ -146,6 +146,10 @@ PROACTIVE_TOPICS: dict[int, str] = {
 DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
+# Чаты, где картинки не передаются, через запятую
+CODEX_IMAGES_OFF_CHATS = {
+    int(x) for x in os.getenv("CODEX_IMAGES_OFF_CHATS", "").replace(" ", "").split(",") if x
+}
 # Раз в ARCHIVE_SWEEP_MINUTES бот проверяет сообщения архива за последние
 # ARCHIVE_SWEEP_HOURS и удаляет из архива удалённые в чате
 ARCHIVE_SWEEP_MINUTES = float(os.getenv("ARCHIVE_SWEEP_MINUTES", "60"))
@@ -963,7 +967,7 @@ async def download_images(chat_id: int, msgs) -> dict[int, str]:
     """Скачивает картинки сообщений в DATA_DIR/chats/<id>/images: message_id → путь.
 
     Файлы старше часа удаляются при следующем вызове."""
-    if not (CODEX_IMAGES and LLM_PROVIDER == "codex"):
+    if not (CODEX_IMAGES and LLM_PROVIDER == "codex") or chat_id in CODEX_IMAGES_OFF_CHATS:
         return {}
     folder = os.path.abspath(os.path.join(DATA_DIR, "chats", str(chat_id), "images"))
     os.makedirs(folder, exist_ok=True)
@@ -1124,7 +1128,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
               if m is not None and media_kind(m) and m.message_id not in seen]
     if unseen:
         hints.append(
-            "Видео, голосовые и файлы тебе не переданы. Если реплика о них и без них ответить нельзя — "
+            "Вложения с пометкой «ты его не видишь» тебе не переданы. Если реплика о них и без них ответить нельзя — "
             "верни SKIP, не гадай и не переспрашивай, что там."
         )
     if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):

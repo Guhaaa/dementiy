@@ -98,6 +98,20 @@ class MediaAndBoostTests(unittest.TestCase):
         self.assertIsNone(maxim_bot.image_file(None))
 
 
+class ImagesFlagTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_without_images_downloads_nothing(self):
+        from unittest import mock
+        names = ("CODEX_IMAGES", "CODEX_IMAGES_OFF_CHATS", "LLM_PROVIDER")
+        saved = {n: getattr(maxim_bot, n) for n in names}
+        self.addCleanup(lambda: [setattr(maxim_bot, n, v) for n, v in saved.items()])
+        maxim_bot.CODEX_IMAGES, maxim_bot.LLM_PROVIDER = True, "codex"
+        maxim_bot.CODEX_IMAGES_OFF_CHATS = {-100}
+        photo = _msg(message_id=3, photo=[SimpleNamespace(file_id="f")], document=None)
+        with mock.patch.object(maxim_bot.bot, "download") as download:
+            self.assertEqual(await maxim_bot.download_images(-100, [photo]), {})
+            download.assert_not_called()
+
+
 class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_distinguishes_deleted_and_existing(self):
         from aiogram.exceptions import TelegramBadRequest
