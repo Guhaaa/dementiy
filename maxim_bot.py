@@ -17,6 +17,7 @@
 """
 
 import json
+import mimetypes
 import os
 import re
 import tempfile
@@ -26,7 +27,7 @@ import asyncio
 import logging
 from collections import deque
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
@@ -39,7 +40,7 @@ from maxim_style import build_hints, build_system_prompt, choose_film_cues, choo
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram import F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -143,6 +144,12 @@ PROACTIVE_TOPICS: dict[int, str] = {
 }
 # Каталог данных (поправки Максима). В Docker — том bot-data.
 DATA_DIR = os.getenv("DATA_DIR", "data")
+# Картинки из сообщений передаются Codex (--image)
+CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
+# Раз в ARCHIVE_SWEEP_MINUTES бот проверяет сообщения архива за последние
+# ARCHIVE_SWEEP_HOURS и удаляет из архива удалённые в чате
+ARCHIVE_SWEEP_MINUTES = float(os.getenv("ARCHIVE_SWEEP_MINUTES", "60"))
+ARCHIVE_SWEEP_HOURS = float(os.getenv("ARCHIVE_SWEEP_HOURS", "48"))
 BOT_ID: int | None = None  # заполняется в main() через get_me()
 BOT_USERNAME: str | None = None
 
@@ -469,6 +476,7 @@ class MaximResponseEngine:
         web_search: bool = False,
         session: bool = False,
         resume: str | None = None,
+        images: list[str] | None = None,
     ) -> tuple[str, str | None]:
         """`codex exec` в каталоге workdir, в песочнице CODEX_SANDBOX.
 
@@ -496,6 +504,7 @@ class MaximResponseEngine:
             args.append("--json")  # первое событие несёт thread_id
         if resume:
             args += ["resume", resume]
+        args += [f"--image={p}" for p in images or []]
         args.append("-")
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -540,6 +549,7 @@ class MaximResponseEngine:
         *,
         task: str | None = None,
         web_search: bool = False,
+        images: list[str] | None = None,
     ) -> str:
         """Ход в сессии Codex этого чата; при ошибке resume — новая сессия.
 
@@ -567,7 +577,7 @@ class MaximResponseEngine:
                 try:
                     text, _ = await self._codex_run(
                         turn, workdir, web_search=web_search,
-                        session=True, resume=session["thread_id"],
+                        session=True, resume=session["thread_id"], images=images,
                     )
                     thread_id, turns = session["thread_id"], session.get("turns", 0) + 1
                 except RuntimeError as e:
@@ -579,7 +589,7 @@ class MaximResponseEngine:
                     build_turn(new_messages, user_message, hints, task=task),
                 ])
                 text, thread_id = await self._codex_run(
-                    prompt, workdir, web_search=web_search, session=True
+                    prompt, workdir, web_search=web_search, session=True, images=images,
                 )
                 turns = 1
                 logging.getLogger(__name__).info(f"[SESSION] новая сессия chat={chat_id}: {thread_id}")
@@ -626,6 +636,7 @@ class MaximResponseEngine:
         context: list[dict] | None = None,
         chat_id: int | None = None,
         extra_hint: str = "",
+        images: list[str] | None = None,
     ) -> str:
         # Ссылка в сообщении — Codex может открыть её через web search
         web_search = LLM_PROVIDER == "codex" and bool(URL_RE.search(user_message))
@@ -666,7 +677,7 @@ class MaximResponseEngine:
             hints += "\n\nВ реплике есть ссылка. Если для ответа нужно её содержимое — открой её."
         if LLM_PROVIDER == "codex" and chat_id is not None:
             return await self._generate_session(
-                chat_id, user_message, context, hints, web_search=web_search
+                chat_id, user_message, context, hints, web_search=web_search, images=images,
             )
         system_prompt = build_system_prompt(cue, film_cues, overrides.prompt_section())
         return await self._generate(user_message, context, system_prompt)
@@ -920,11 +931,96 @@ _MEDIA_KINDS = {
 
 
 def media_kind(msg) -> str:
-    """Что приложено к сообщению и чего модель не видит: «фото», «видео»… или ""."""
+    """Что приложено к сообщению: «фото», «видео»… или ""."""
     return next((name for attr, name in _MEDIA_KINDS.items() if getattr(msg, attr, None)), "")
 
 
-def reply_block(message) -> str:
+def media_mark(msg, seen: set[int]) -> str:
+    """Отметка вложения для модели; seen — id сообщений, чьи картинки ей переданы."""
+    if not (kind := media_kind(msg)):
+        return ""
+    if msg.message_id in seen:
+        return f"{kind}, передано тебе картинкой"
+    return f"{kind}, ты его не видишь"
+
+
+MAX_IMAGE_BYTES = 10_000_000
+
+
+def image_file(msg) -> tuple[str, str] | None:
+    """(file_id, расширение) картинки сообщения: фото или файл-картинка."""
+    if msg is None:
+        return None
+    if msg.photo:
+        return msg.photo[-1].file_id, ".jpg"
+    d = msg.document
+    if d and (d.mime_type or "").startswith("image/") and (d.file_size or 0) <= MAX_IMAGE_BYTES:
+        return d.file_id, mimetypes.guess_extension(d.mime_type) or ".jpg"
+    return None
+
+
+async def download_images(chat_id: int, msgs) -> dict[int, str]:
+    """Скачивает картинки сообщений в DATA_DIR/chats/<id>/images: message_id → путь.
+
+    Файлы старше часа удаляются при следующем вызове."""
+    if not (CODEX_IMAGES and LLM_PROVIDER == "codex"):
+        return {}
+    folder = os.path.abspath(os.path.join(DATA_DIR, "chats", str(chat_id), "images"))
+    os.makedirs(folder, exist_ok=True)
+    cutoff = time.time() - 3600
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if os.path.getmtime(path) < cutoff:
+            os.unlink(path)
+    paths = {}
+    for msg in msgs:
+        if not (found := image_file(msg)):
+            continue
+        path = os.path.join(folder, f"{msg.message_id}{found[1]}")
+        try:
+            await bot.download(found[0], destination=path)
+            paths[msg.message_id] = path
+        except Exception as e:
+            logger.warning(f"[IMAGE] не скачал картинку {msg.message_id}: {e}")
+    return paths
+
+
+async def message_exists(chat_id: int, message_id: int) -> bool:
+    """Есть ли сообщение в чате. Bot API не сообщает об удалениях, поэтому
+    ставим пустую реакцию: на удалённое Telegram отвечает «message to react not found»,
+    на существующее — REACTION_EMPTY, и реакция не появляется."""
+    try:
+        await bot.set_message_reaction(chat_id, message_id, [])
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return True
+    except TelegramBadRequest as e:
+        return "not found" not in str(e).lower()
+    except Exception:
+        return True
+    return True
+
+
+def cited_ids(chat_id: int, text: str) -> set[int]:
+    """id сообщений этого чата, на которые ссылается текст."""
+    base = re.escape(chat_archive.link_base(chat_id))
+    return {int(i) for i in re.findall(rf"{base}/(\d+)", text)}
+
+
+async def drop_deleted(chat_id: int, ids, pause: float = 0) -> set[int]:
+    """Проверяет сообщения и удаляет из архива те, что удалили в чате."""
+    gone = set()
+    for message_id in ids:
+        if not await message_exists(chat_id, message_id):
+            gone.add(message_id)
+        await asyncio.sleep(pause)
+    if gone:
+        chat_archive.remove(chat_id, gone)
+        logger.info(f"[ARCHIVE] chat_id={chat_id}: удалены из архива {sorted(gone)}")
+    return gone
+
+
+def reply_block(message, seen: set[int] = frozenset()) -> str:
     """Сообщение, на которое ответили: автор, текст (или выделенная цитата) и ссылки."""
     r = message.reply_to_message
     # В темах форума каждое сообщение — «ответ» на начало темы
@@ -936,8 +1032,8 @@ def reply_block(message) -> str:
         who = r.author_signature or (r.from_user.full_name if r.from_user else "Unknown")
     quote = message.quote.text if message.quote else ""
     body = (quote or r.text or r.caption or "")[:1500]
-    if kind := media_kind(r):
-        body = f"[{kind}, ты его не видишь] {body}".strip()
+    if mark := media_mark(r, seen):
+        body = f"[{mark}] {body}".strip()
     body = body or "[без текста]"
     links = [u for u in hidden_links(r) if u not in body]
     return "\n".join([f"[В ответ на сообщение {who}]: {body}", *links])
@@ -951,8 +1047,8 @@ async def _process_message(message: types.Message, *, private: bool = False):
         logger.info(f"[SKIP] bot_started=False — отправьте /start боту в личку")
         return
 
-    # Пропускаем служебные сообщения и свои ответы
-    if not message.text and not message.caption:
+    # Пропускаем служебные сообщения и свои ответы; фото без подписи идёт в архив
+    if not message.text and not message.caption and not media_kind(message):
         logger.info(f"[SKIP] нет текста (text={message.text!r} caption={message.caption!r})")
         return
     if message.from_user and message.from_user.is_bot:
@@ -1006,20 +1102,29 @@ async def _process_message(message: types.Message, *, private: bool = False):
         is_bot_mentioned(text, BOT_USERNAME) or bool(DEMENTIY_RE.search(text))
     )
     force_respond = private or is_reply_to_bot or is_mentioned
+    # Вложение без подписи: отвечаем, только если обратились к боту
+    if not text and not force_respond:
+        return
+
+    # Картинки сообщения и того, на что ответили, модель видит сама
+    images = await download_images(chat_id, [message, message.reply_to_message])
+    seen = set(images)
 
     # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
-    llm_text = "\n".join([text, *(u for u in links if u not in text)])
-    if kind := media_kind(message):
-        llm_text = f"[к сообщению приложено: {kind}, ты его не видишь]\n{llm_text}"
-    if quoted := reply_block(message):
+    llm_text = "\n".join([text, *(u for u in links if u not in text)]).strip()
+    if mark := media_mark(message, seen):
+        llm_text = f"[к сообщению приложено: {mark}]\n{llm_text}"
+    if quoted := reply_block(message, seen):
         llm_text = f"{quoted}\n{llm_text}"
 
     # Максим обращается к боту (в личке — любое сообщение): сначала агент ищет поправку.
     # Поправка не отменяет ответ: в той же реплике может быть и вопрос.
     hints = []
-    if media_kind(message) or (message.reply_to_message and media_kind(message.reply_to_message)):
+    unseen = [m for m in (message, message.reply_to_message)
+              if m is not None and media_kind(m) and m.message_id not in seen]
+    if unseen:
         hints.append(
-            "Ты не видишь фото, видео и файлы. Если реплика о них и без них ответить нельзя — "
+            "Видео, голосовые и файлы тебе не переданы. Если реплика о них и без них ответить нельзя — "
             "верни SKIP, не гадай и не переспрашивай, что там."
         )
     if user_id in PERSONA_IDS and (private or is_reply_to_bot or is_mentioned):
@@ -1082,7 +1187,18 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Генерируем ответ
     try:
-        response = await response_engine.generate(llm_text, context_messages, chat_id, "\n".join(hints))
+        response = await response_engine.generate(
+            llm_text, context_messages, chat_id, "\n".join(hints), list(images.values())
+        )
+        # Ответ ссылается на сообщение, которое удалили: убираем его из архива и отвечаем заново
+        if not private and (gone := await drop_deleted(chat_id, cited_ids(chat_id, response))):
+            hints.append(
+                f"Сообщения {', '.join(map(str, sorted(gone)))} удалили из чата, в архиве их больше нет. "
+                "Не ссылайся на них. Если ответ держался на них — верни SKIP."
+            )
+            response = await response_engine.generate(
+                llm_text, context_messages, chat_id, "\n".join(hints), list(images.values())
+            )
     except Exception as e:
         logger.error(f"[LLM ERROR] {e}")
         return
@@ -1183,6 +1299,22 @@ async def proactive_loop() -> None:
         await asyncio.sleep(min(max(wait, 5), 600))
 
 
+async def archive_sweep_loop() -> None:
+    """Bot API не сообщает об удалённых сообщениях: проверяем свежие сами."""
+    chats_dir = os.path.join(DATA_DIR, "chats")
+    while True:
+        await asyncio.sleep(ARCHIVE_SWEEP_MINUTES * 60)
+        since = (datetime.now(timezone.utc) - timedelta(hours=ARCHIVE_SWEEP_HOURS)).isoformat()
+        for name in os.listdir(chats_dir) if os.path.isdir(chats_dir) else []:
+            try:
+                chat_id = int(name)
+            except ValueError:
+                continue
+            if chat_id > 0 or not os.path.exists(chat_archive.path(chat_id)):
+                continue
+            await drop_deleted(chat_id, chat_archive.recent_ids(chat_id, since), pause=0.5)
+
+
 # ---------------------------------------------------------------------------
 # Запуск
 # ---------------------------------------------------------------------------
@@ -1197,6 +1329,8 @@ async def main():
     BOT_ID = me.id
     BOT_USERNAME = me.username
     logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{BOT_USERNAME}")
+    if ARCHIVE_SWEEP_MINUTES > 0:
+        asyncio.create_task(archive_sweep_loop())
     if PROACTIVE_ENABLED and LLM_PROVIDER == "codex":
         asyncio.create_task(proactive_loop())
     elif PROACTIVE_ENABLED:

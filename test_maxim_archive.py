@@ -55,6 +55,15 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(fresh.link_base(-1002497337650), "https://t.me/share_your_prompt")
         self.assertEqual(message_link_base(-100555, None), "https://t.me/c/555")
 
+    def test_remove_and_recent_ids(self):
+        for i, date in [(1, "2026-11-08T10:00:00+00:00"), (2, "2026-11-09T10:00:00+00:00"),
+                        (3, "2026-11-09T11:00:00+00:00")]:
+            self.archive.append(-1001, record(i, date, "G", "t"))
+        self.assertEqual(self.archive.recent_ids(-1001, "2026-11-09T00:00:00+00:00"), [2, 3])
+        self.assertEqual(self.archive.remove(-1001, {2, 99}), 1)
+        self.assertEqual(self.archive.ids(-1001), {1, 3})
+        self.assertEqual(self.archive.remove(-1001, {99}), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

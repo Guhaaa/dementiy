@@ -84,6 +84,37 @@ class MediaAndBoostTests(unittest.TestCase):
         photo = _msg(message_id=5, photo=[object()], from_user=SimpleNamespace(id=7, full_name="R"))
         self.assertIn("[фото, ты его не видишь]", maxim_bot.reply_block(_msg(reply_to_message=photo)))
         self.assertEqual(maxim_bot.media_kind(_msg(text="просто текст")), "")
+        seen = maxim_bot.reply_block(_msg(reply_to_message=photo), {5})
+        self.assertIn("[фото, передано тебе картинкой]", seen)
+
+    def test_image_file_takes_largest_photo_and_image_documents(self):
+        big = SimpleNamespace(file_id="big")
+        self.assertEqual(maxim_bot.image_file(_msg(photo=[SimpleNamespace(file_id="s"), big], document=None)),
+                         ("big", ".jpg"))
+        png = SimpleNamespace(mime_type="image/png", file_size=1000, file_id="p")
+        self.assertEqual(maxim_bot.image_file(_msg(photo=None, document=png)), ("p", ".png"))
+        pdf = SimpleNamespace(mime_type="application/pdf", file_size=1000, file_id="d")
+        self.assertIsNone(maxim_bot.image_file(_msg(photo=None, document=pdf)))
+        self.assertIsNone(maxim_bot.image_file(None))
+
+
+class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_distinguishes_deleted_and_existing(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from unittest import mock
+
+        async def react(chat_id, message_id, reaction):
+            raise TelegramBadRequest(method=None, message=(
+                "Bad Request: message to react not found" if message_id == 1 else "Bad Request: REACTION_EMPTY"))
+        with mock.patch.object(maxim_bot.bot, "set_message_reaction", side_effect=react):
+            self.assertFalse(await maxim_bot.message_exists(-100, 1))
+            self.assertTrue(await maxim_bot.message_exists(-100, 2))
+
+    def test_cited_ids_only_this_chat(self):
+        from unittest import mock
+        with mock.patch.object(maxim_bot.chat_archive, "link_base", return_value="https://t.me/c/555"):
+            text = "было [тут](https://t.me/c/555/12) и https://t.me/c/999/13 и https://t.me/c/555/14"
+            self.assertEqual(maxim_bot.cited_ids(-100555, text), {12, 14})
 
     def test_user_boost_shifts_score(self):
         names = ("USER_TRIGGER_BOOST", "RANDOM_JITTER", "RANDOM_LONGSHOT", "RANDOM_SILENCE")
@@ -131,6 +162,22 @@ class CodexProviderTests(unittest.TestCase):
             without = asyncio.run(engine._codex_exec("x"))
         self.assertEqual(with_web, "mcp hint")
         self.assertEqual(without, "none nohint")
+
+    def test_images_go_right_before_stdin_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "codex")
+            with open(fake, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    'all="$*"; while [ "$1" ]; do [ "$1" = -o ] && out="$2"; shift; done\n'
+                    'echo "$all" > "$out"\n'
+                )
+            os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+            maxim_bot.CODEX_BIN = fake
+            engine = maxim_bot.MaximResponseEngine()
+            argv, _ = asyncio.run(engine._codex_run(
+                "x", tmp, session=True, resume="T", images=["/a.jpg", "/b.png"]))
+        self.assertTrue(argv.endswith("resume T --image=/a.jpg --image=/b.png -"), argv)
 
 
 if __name__ == "__main__":

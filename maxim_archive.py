@@ -87,11 +87,30 @@ class ChatArchive:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def ids(self, chat_id: int) -> set[int]:
+        return {m["id"] for m in self._read(chat_id)}
+
+    def _read(self, chat_id: int) -> list[dict]:
         try:
             with open(self.path(chat_id), encoding="utf-8") as f:
-                return {json.loads(line)["id"] for line in f if line.strip()}
+                return [json.loads(line) for line in f if line.strip()]
         except FileNotFoundError:
-            return set()
+            return []
+
+    def recent_ids(self, chat_id: int, since: str) -> list[int]:
+        """id сообщений с датой не раньше since (ISO в UTC, как в архиве)."""
+        return [m["id"] for m in self._read(chat_id) if m["date"] >= since]
+
+    def remove(self, chat_id: int, ids: set[int]) -> int:
+        """Удаляет сообщения из архива (их удалили в чате). Возвращает, сколько удалено."""
+        records = self._read(chat_id)
+        kept = [m for m in records if m["id"] not in ids]
+        if len(kept) == len(records):
+            return 0
+        tmp = self.path(chat_id) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(m, ensure_ascii=False) + "\n" for m in kept)
+        os.replace(tmp, self.path(chat_id))
+        return len(records) - len(kept)
 
     def remember_username(self, chat_id: int, username: str | None) -> None:
         """username публичной группы нужен для ссылок; храним в meta.json."""
