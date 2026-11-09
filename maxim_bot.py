@@ -30,6 +30,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
+from maxim_archive import ChatArchive, record
 from maxim_overrides import EXTRACT_PROMPT, Correction, Overrides, PendingCorrections, parse_correction
 from maxim_format import md_to_telegram_html
 from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
@@ -592,7 +593,10 @@ class MaximResponseEngine:
         """В сессии этого чата Codex ищет в интернете находку и пишет о ней."""
         raw = await self._generate_session(
             chat_id, None, channel_context.get_recent(chat_id, 30), "",
-            task=build_task(recent, PROACTIVE_TOPICS.get(chat_id, "")), web_search=True,
+            task="\n\n".join(filter(None, [
+                build_task(recent, PROACTIVE_TOPICS.get(chat_id, "")), archive_hint(chat_id),
+            ])),
+            web_search=True,
         )
         return clean_post(raw)
 
@@ -656,6 +660,8 @@ class MaximResponseEngine:
         hints = build_hints(cue, film_cues)
         if extra_hint:
             hints += f"\n\n{extra_hint}"
+        if chat_id is not None and (archived := archive_hint(chat_id)):
+            hints += f"\n\n{archived}"
         if web_search:
             hints += "\n\nВ реплике есть ссылка. Если для ответа нужно её содержимое — открой её."
         if LLM_PROVIDER == "codex" and chat_id is not None:
@@ -728,6 +734,20 @@ bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMod
 dp = Dispatcher()
 rate_limiter = RateLimiter()
 overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
+chat_archive = ChatArchive(DATA_DIR)
+
+
+def archive_hint(chat_id: int) -> str:
+    """Как искать в архиве чата; пусто, если архива нет (например, в личке)."""
+    if not os.path.exists(chat_archive.path(chat_id)):
+        return ""
+    return (
+        "В рабочем каталоге есть archive.jsonl — архив этого чата, по сообщению в строке "
+        "(поля id, date, from, text, links, reply_to, media). Ищи в нём grep'ом, файлы не меняй. "
+        "Ищи по нескольким корням и синонимам, по-русски и по-английски, и по ссылке. "
+        "Новость часто приходила скриншотом (media: фото): тогда о ней говорят подпись и ответы рядом (reply_to). "
+        f"Ссылка на сообщение из архива: {chat_archive.link_base(chat_id)}/<id>."
+    )
 proactive_state = ProactiveState(os.path.join(DATA_DIR, "proactive.json"))
 chat_sessions = ChatSessions(os.path.join(DATA_DIR, "sessions.json"), CODEX_SESSION_MAX_TURNS)
 response_engine = MaximResponseEngine()
@@ -877,6 +897,16 @@ async def on_correction_button(call: CallbackQuery):
     await call.answer()
 
 
+def archive_bot_message(chat_id: int, sent, text: str) -> None:
+    """Свои сообщения тоже в архив групп: на них могут ссылаться как на дубль."""
+    if sent is None or chat_id > 0:
+        return
+    chat_archive.append(chat_id, record(
+        sent.message_id, sent.date.isoformat(), BOT_LABEL, text, None,
+        sent.reply_to_message.message_id if sent.reply_to_message else None,
+    ))
+
+
 def hidden_links(msg) -> list[str]:
     """Ссылки, спрятанные под текстом (entity text_link): в самом тексте их нет."""
     return [e.url for e in (msg.entities or msg.caption_entities or [])
@@ -955,6 +985,14 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # снимка, чтобы LLM не увидела её дважды и чтобы разные чаты не смешивались.
     context_messages = channel_context.get_recent(chat_id, 30)
     channel_context.add(chat_id, text, sender)
+    links = hidden_links(message)
+    if not private:
+        chat_archive.remember_username(chat_id, message.chat.username)
+        chat_archive.append(chat_id, record(
+            message.message_id, message.date.isoformat(), sender, text, links,
+            message.reply_to_message.message_id if message.reply_to_message else None,
+            media_kind(message),
+        ))
 
     # Проверяем, ответил ли кто-то на сообщение бота
     is_reply_to_bot = (
@@ -970,7 +1008,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
     force_respond = private or is_reply_to_bot or is_mentioned
 
     # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
-    llm_text = "\n".join([text, *(u for u in hidden_links(message) if u not in text)])
+    llm_text = "\n".join([text, *(u for u in links if u not in text)])
     if kind := media_kind(message):
         llm_text = f"[к сообщению приложено: {kind}, ты его не видишь]\n{llm_text}"
     if quoted := reply_block(message):
@@ -1008,18 +1046,39 @@ async def _process_message(message: types.Message, *, private: bool = False):
             trigger.reasons.insert(0, "ответ на сообщение бота")
     logger.info(f"[TRIGGER] from={sender} score={trigger.score} respond={trigger.will_respond} reasons={trigger.reasons}")
 
-    if not trigger.will_respond:
-        return
+    # Новость или ссылка: проверяем по архиву, не было ли её уже в чате
+    is_news = not private and not force_respond and bool(
+        URL_RE.search(text) or links or getattr(message, "forward_origin", None)
+    )
+    if is_news and os.path.exists(chat_archive.path(chat_id)):
+        hints.append(
+            "Это похоже на новость или ссылку. Сначала проверь по архиву чата, не было ли её уже: "
+            "та же ссылка или та же новость другими словами (ищи по ключевым словам). "
+            "Если было — коротко скажи об этом со ссылкой на то сообщение."
+        )
+    else:
+        is_news = False
 
-    # reply и @упоминание — без кулдауна, но с потолком на чат против спама
-    if force_respond and not private and not rate_limiter.direct_ok(chat_id):
+    # Слабый триггер или кулдаун: для новости остаётся только проверка на дубль
+    dup_only = False
+    if not force_respond:
+        can_respond, reason = (
+            rate_limiter.can_respond(chat_id, user_id) if trigger.will_respond else (False, "слабый триггер")
+        )
+        if not can_respond:
+            if not is_news:
+                if trigger.will_respond:
+                    logger.info(f"[RATE-LIMIT] {reason} for {sender}")
+                return
+            dup_only = True
+            hints.append("Отвечай, только если нашёл эту новость в архиве. Иначе верни SKIP.")
+            logger.info(f"[DUP-CHECK] {reason}: проверяю новость по архиву")
+
+    # reply, @упоминание и проверка дублей — без кулдауна, но с потолком на чат против спама
+    direct = force_respond or dup_only
+    if direct and not private and not rate_limiter.direct_ok(chat_id):
         logger.info(f"[RATE-LIMIT] потолок прямых ответов в chat_id={chat_id}")
         return
-    if not force_respond:
-        can_respond, reason = rate_limiter.can_respond(chat_id, user_id)
-        if not can_respond:
-            logger.info(f"[RATE-LIMIT] {reason} for {sender}")
-            return
 
     # Генерируем ответ
     try:
@@ -1030,7 +1089,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Проверка качества ответа: не отправляем пустые или формальные ответы
     # на слабые триггеры
-    if not force_respond and trigger.score < 30 and len(response) < 10:
+    if not direct and trigger.score < 30 and len(response) < 10:
         logger.info(f"[QUALITY] Ответ слишком короткий для слабого триггера, пропускаем")
         return
 
@@ -1042,10 +1101,11 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Отправляем
     try:
-        await send_formatted(chat_id, response, reply_to=message)
+        sent = await send_formatted(chat_id, response, reply_to=message)
         channel_context.add(chat_id, response, BOT_LABEL, is_bot=True)
-        rate_limiter.record_response(chat_id, user_id, cooldown=not force_respond)
-        if force_respond:
+        archive_bot_message(chat_id, sent, response)
+        rate_limiter.record_response(chat_id, user_id, cooldown=not direct)
+        if direct:
             rate_limiter.record_direct(chat_id)
         logger.info(f"[SENT] to={sender} trigger_score={trigger.score} response={response[:100]}")
     except Exception as e:
@@ -1096,8 +1156,9 @@ async def _proactive_post(chat_id: int) -> None:
         logger.info(f"[PROACTIVE] chat_id={chat_id}: пропуск, нет поста")
         return
     try:
-        await send_formatted(chat_id, post)
+        sent = await send_formatted(chat_id, post)
         channel_context.add(chat_id, post, BOT_LABEL, is_bot=True)
+        archive_bot_message(chat_id, sent, post)
     except Exception as e:
         logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
         return
