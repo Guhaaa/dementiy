@@ -113,10 +113,9 @@ class ImagesFlagTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HumanDelayTests(unittest.TestCase):
-    def test_generation_time_counts_toward_delay(self):
+    def test_delay_is_within_bounds(self):
         for _ in range(50):
-            self.assertTrue(10 - 4 <= maxim_bot.human_delay(4) <= 15 - 4)
-        self.assertEqual(maxim_bot.human_delay(20), 0)
+            self.assertTrue(10 <= maxim_bot.human_delay() <= 15)
 
 
 class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
