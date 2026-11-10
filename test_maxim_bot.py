@@ -112,6 +112,13 @@ class ImagesFlagTests(unittest.IsolatedAsyncioTestCase):
             download.assert_not_called()
 
 
+class HumanDelayTests(unittest.TestCase):
+    def test_generation_time_counts_toward_delay(self):
+        for _ in range(50):
+            self.assertTrue(10 - 4 <= maxim_bot.human_delay(4) <= 15 - 4)
+        self.assertEqual(maxim_bot.human_delay(20), 0)
+
+
 class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_distinguishes_deleted_and_existing(self):
         from aiogram.exceptions import TelegramBadRequest

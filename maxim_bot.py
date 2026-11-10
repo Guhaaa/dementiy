@@ -146,6 +146,10 @@ PROACTIVE_TOPICS: dict[int, str] = {
 DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
+# Ответ уходит не раньше чем через RESPONSE_DELAY_MIN..MAX секунд после сообщения:
+# мгновенный ответ выдаёт бота. Время генерации входит в эту паузу.
+RESPONSE_DELAY_MIN = float(os.getenv("RESPONSE_DELAY_MIN", "10"))
+RESPONSE_DELAY_MAX = float(os.getenv("RESPONSE_DELAY_MAX", "15"))
 # Чаты, где картинки не передаются, через запятую
 CODEX_IMAGES_OFF_CHATS = {
     int(x) for x in os.getenv("CODEX_IMAGES_OFF_CHATS", "").replace(" ", "").split(",") if x
@@ -934,6 +938,12 @@ _MEDIA_KINDS = {
 }
 
 
+def human_delay(elapsed: float) -> float:
+    """Сколько ещё ждать перед ответом, если на генерацию ушло elapsed секунд."""
+    target = random.uniform(RESPONSE_DELAY_MIN, max(RESPONSE_DELAY_MIN, RESPONSE_DELAY_MAX))
+    return max(0.0, target - elapsed)
+
+
 def media_kind(msg) -> str:
     """Что приложено к сообщению: «фото», «видео»… или ""."""
     return next((name for attr, name in _MEDIA_KINDS.items() if getattr(msg, attr, None)), "")
@@ -1046,6 +1056,7 @@ def reply_block(message, seen: set[int] = frozenset()) -> str:
 async def _process_message(message: types.Message, *, private: bool = False):
     """Общая логика обработки сообщения (канал или группа)."""
     global bot_started
+    received = time.monotonic()
 
     if not bot_started:
         logger.info(f"[SKIP] bot_started=False — отправьте /start боту в личку")
@@ -1218,6 +1229,11 @@ async def _process_message(message: types.Message, *, private: bool = False):
     if response.strip().upper().startswith("SKIP"):
         logger.info(f"[SKIP-LLM] модель решила не отвечать: from={sender}")
         return
+
+    # Пауза как у человека: генерация входит в неё
+    if (pause := human_delay(time.monotonic() - received)) > 0:
+        logger.info(f"[DELAY] жду {pause:.1f}с перед ответом")
+        await asyncio.sleep(pause)
 
     # Отправляем
     try:
