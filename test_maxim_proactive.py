@@ -43,6 +43,15 @@ class PostTests(unittest.TestCase):
         self.assertIn("выбирай из них: баня, книги.", build_task([], "баня, книги"))
         self.assertNotIn("заданы владельцем", build_task([]))
 
+    def test_angle_and_other_source_than_recent_posts(self):
+        recent = ["a [x](https://arxiv.org/abs/1)", "b [y](https://www.redwoodresearch.org/blog/z)"]
+        task = build_task(recent, rng=random.Random(1))
+        self.assertIn("Вид находки на этот раз:", task)
+        self.assertIn("не с arxiv.org, redwoodresearch.org", task)
+        self.assertNotIn("Источник возьми с другого сайта", build_task([]))
+        angles = {build_task([], rng=random.Random(i)).split("на этот раз: ")[1] for i in range(200)}
+        self.assertGreater(len(angles), 4)
+
     def test_state_per_chat_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "proactive.json")
