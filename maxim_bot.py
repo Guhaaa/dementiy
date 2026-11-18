@@ -43,7 +43,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram import F
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from aiogram.client.default import DefaultBotProperties
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,10 @@ PROACTIVE_TOPICS: dict[int, str] = {
 DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
+# Реакции, которые бот может ставить (из стандартного набора Telegram)
+REACTIONS = os.getenv("REACTIONS", "👍 ❤ 🔥 😁 🤣 👏 🤔 🤯 💯 👌 🤝 🗿 🙈 😢 🎉 🏆").split()
+# Шутку без повода для ответа бот проверяет «на лайк» не чаще раза в REACT_CHECK_MINUTES в чате
+REACT_CHECK_MINUTES = float(os.getenv("REACT_CHECK_MINUTES", "10"))
 # После генерации бот ждёт RESPONSE_DELAY_MIN..MAX секунд: мгновенный ответ выдаёт бота
 RESPONSE_DELAY_MIN = float(os.getenv("RESPONSE_DELAY_MIN", "10"))
 RESPONSE_DELAY_MAX = float(os.getenv("RESPONSE_DELAY_MAX", "15"))
@@ -940,6 +944,36 @@ _MEDIA_KINDS = {
 }
 
 
+REACTION_HINT = (
+    "Можешь поставить реакцию на эту реплику, как человек ставит лайк: первой строкой ответа "
+    f"напиши REACT и один смайлик из {' '.join(REACTIONS)}. Ставь, когда реплика правда смешная, "
+    "точная или тёплая, а не на каждую. Если реакции хватит и словами отвечать не нужно — "
+    "после строки REACT напиши SKIP."
+)
+_REACT_RE = re.compile(r"^\s*REACT:?[ \t]*(\S+)[ \t]*\n?", re.IGNORECASE)
+
+
+def parse_reaction(text: str) -> tuple[str | None, str]:
+    """«REACT 😁\nтекст» → ("😁", "текст"). Смайлик не из REACTIONS отбрасывается."""
+    m = _REACT_RE.match(text)
+    if not m:
+        return None, text
+    emoji = m.group(1).replace("\ufe0f", "")
+    return (emoji if emoji in REACTIONS else None), text[m.end():].strip()
+
+
+_last_react_check: dict[int, float] = {}
+
+
+def react_check_ok(chat_id: int) -> bool:
+    """Не чаще раза в REACT_CHECK_MINUTES проверяем шутку только ради реакции."""
+    now = time.time()
+    if now - _last_react_check.get(chat_id, 0.0) < REACT_CHECK_MINUTES * 60:
+        return False
+    _last_react_check[chat_id] = now
+    return True
+
+
 def human_delay() -> float:
     """Пауза перед отправкой готового ответа, в секундах."""
     return random.uniform(RESPONSE_DELAY_MIN, max(RESPONSE_DELAY_MIN, RESPONSE_DELAY_MAX))
@@ -1179,20 +1213,28 @@ async def _process_message(message: types.Message, *, private: bool = False):
     else:
         is_news = False
 
-    # Слабый триггер или кулдаун: для новости остаётся только проверка на дубль
-    dup_only = False
+    hints.append(REACTION_HINT)
+
+    # Слабый триггер или кулдаун: для новости остаётся только проверка на дубль,
+    # для шутки — только реакция
+    dup_only = react_only = False
     if not force_respond:
         can_respond, reason = (
             rate_limiter.can_respond(chat_id, user_id) if trigger.will_respond else (False, "слабый триггер")
         )
         if not can_respond:
-            if not is_news:
+            if is_news:
+                dup_only = True
+                hints.append("Отвечай, только если нашёл эту новость в архиве. Иначе верни SKIP.")
+                logger.info(f"[DUP-CHECK] {reason}: проверяю новость по архиву")
+            elif "юмор" in trigger.reasons and react_check_ok(chat_id):
+                react_only = True
+                hints.append("Словами сейчас не отвечай: верни REACT со смайликом и SKIP, либо просто SKIP.")
+                logger.info(f"[REACT-CHECK] {reason}: шутка, проверяю на реакцию")
+            else:
                 if trigger.will_respond:
                     logger.info(f"[RATE-LIMIT] {reason} for {sender}")
                 return
-            dup_only = True
-            hints.append("Отвечай, только если нашёл эту новость в архиве. Иначе верни SKIP.")
-            logger.info(f"[DUP-CHECK] {reason}: проверяю новость по архиву")
 
     # reply, @упоминание и проверка дублей — без кулдауна, но с потолком на чат против спама
     direct = force_respond or dup_only
@@ -1218,15 +1260,14 @@ async def _process_message(message: types.Message, *, private: bool = False):
         logger.error(f"[LLM ERROR] {e}")
         return
 
-    # Проверка качества ответа: не отправляем пустые или формальные ответы
-    # на слабые триггеры
-    if not direct and trigger.score < 30 and len(response) < 10:
+    reaction, response = parse_reaction(response)
+    # Текст не отправляем: пустой, SKIP, режим «только реакция»
+    # или слишком короткий ответ на слабый триггер
+    say = bool(response.strip()) and not response.strip().upper().startswith("SKIP") and not react_only
+    if say and not direct and trigger.score < 30 and len(response) < 10:
         logger.info(f"[QUALITY] Ответ слишком короткий для слабого триггера, пропускаем")
-        return
-
-    if not response.strip():
-        return
-    if response.strip().upper().startswith("SKIP"):
+        say = False
+    if not say and not reaction:
         logger.info(f"[SKIP-LLM] модель решила не отвечать: from={sender}")
         return
 
@@ -1234,6 +1275,15 @@ async def _process_message(message: types.Message, *, private: bool = False):
     if (pause := human_delay()) > 0:
         logger.info(f"[DELAY] жду {pause:.1f}с перед ответом")
         await asyncio.sleep(pause)
+
+    if reaction:
+        try:
+            await bot.set_message_reaction(chat_id, message.message_id, [ReactionTypeEmoji(emoji=reaction)])
+            logger.info(f"[REACT] {reaction} на сообщение {sender}")
+        except Exception as e:
+            logger.warning(f"[REACT ERROR] {reaction}: {e}")
+    if not say:
+        return
 
     # Отправляем
     try:

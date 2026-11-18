@@ -118,6 +118,21 @@ class HumanDelayTests(unittest.TestCase):
             self.assertTrue(10 <= maxim_bot.human_delay() <= 15)
 
 
+class ReactionTests(unittest.TestCase):
+    def test_parse_reaction(self):
+        self.assertEqual(maxim_bot.parse_reaction("REACT 😁\nSKIP"), ("😁", "SKIP"))
+        self.assertEqual(maxim_bot.parse_reaction("REACT: ❤️\nСогласен."), ("❤", "Согласен."))
+        self.assertEqual(maxim_bot.parse_reaction("REACT 🐸\nтекст"), (None, "текст"))
+        self.assertEqual(maxim_bot.parse_reaction("Просто ответ"), (None, "Просто ответ"))
+
+    def test_react_check_is_rate_limited_per_chat(self):
+        maxim_bot._last_react_check.clear()
+        self.addCleanup(maxim_bot._last_react_check.clear)
+        self.assertTrue(maxim_bot.react_check_ok(-1))
+        self.assertFalse(maxim_bot.react_check_ok(-1))
+        self.assertTrue(maxim_bot.react_check_ok(-2))
+
+
 class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_distinguishes_deleted_and_existing(self):
         from aiogram.exceptions import TelegramBadRequest
