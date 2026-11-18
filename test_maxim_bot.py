@@ -68,7 +68,7 @@ class ReplyBlockTests(unittest.TestCase):
         original = _msg(message_id=5, text="9 моделей мышления", entities=[link],
                         from_user=SimpleNamespace(id=7, full_name="Roman"))
         block = maxim_bot.reply_block(_msg(text="посмотри", reply_to_message=original))
-        self.assertIn("[В ответ на сообщение Roman]: 9 моделей мышления", block)
+        self.assertIn("[В ответ на сообщение #5 Roman]: 9 моделей мышления", block)
         self.assertIn("https://smart-lab.ru/x", block)
 
     def test_selected_quote_wins_and_topic_root_is_ignored(self):
@@ -120,10 +120,12 @@ class HumanDelayTests(unittest.TestCase):
 
 class ReactionTests(unittest.TestCase):
     def test_parse_reaction(self):
-        self.assertEqual(maxim_bot.parse_reaction("REACT 😁\nSKIP"), ("😁", "SKIP"))
-        self.assertEqual(maxim_bot.parse_reaction("REACT: ❤️\nСогласен."), ("❤", "Согласен."))
-        self.assertEqual(maxim_bot.parse_reaction("REACT 🐸\nтекст"), (None, "текст"))
-        self.assertEqual(maxim_bot.parse_reaction("Просто ответ"), (None, "Просто ответ"))
+        self.assertEqual(maxim_bot.parse_reaction("REACT 😁\nSKIP"), ("😁", None, "SKIP"))
+        self.assertEqual(maxim_bot.parse_reaction("REACT: ❤️\nСогласен."), ("❤", None, "Согласен."))
+        self.assertEqual(maxim_bot.parse_reaction("REACT 👍 #9301\nSKIP"), ("👍", 9301, "SKIP"))
+        self.assertEqual(maxim_bot.parse_reaction("REACT 👍#7"), ("👍", 7, ""))
+        self.assertEqual(maxim_bot.parse_reaction("REACT 🐸\nтекст"), (None, None, "текст"))
+        self.assertEqual(maxim_bot.parse_reaction("Просто ответ"), (None, None, "Просто ответ"))
 
     def test_react_check_is_rate_limited_per_chat(self):
         maxim_bot._last_react_check.clear()

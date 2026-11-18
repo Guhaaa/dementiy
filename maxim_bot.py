@@ -713,9 +713,11 @@ class ChannelContext:
     def total_size(self) -> int:
         return sum(len(messages) for messages in self.messages_by_chat.values())
 
-    def add(self, chat_id: int, text: str, sender: str, *, is_bot: bool = False):
+    def add(self, chat_id: int, text: str, sender: str, *, is_bot: bool = False,
+            message_id: int | None = None):
         message = {
             "chat_id": chat_id,
+            "id": message_id,
             "text": text,
             "from": BOT_LABEL if is_bot else sender,
             "date": datetime.now().isoformat(),
@@ -944,22 +946,28 @@ _MEDIA_KINDS = {
 }
 
 
-REACTION_HINT = (
-    "Можешь поставить реакцию на эту реплику, как человек ставит лайк: первой строкой ответа "
-    f"напиши REACT и один смайлик из {' '.join(REACTIONS)}. Ставь, когда реплика правда смешная, "
-    "точная или тёплая, а не на каждую. Если реакции хватит и словами отвечать не нужно — "
-    "после строки REACT напиши SKIP."
-)
-_REACT_RE = re.compile(r"^\s*REACT:?[ \t]*(\S+)[ \t]*\n?", re.IGNORECASE)
+def reaction_hint(message_id: int) -> str:
+    return (
+        f"Можешь поставить реакцию, как человек ставит лайк: первой строкой ответа напиши REACT "
+        f"и один смайлик из {' '.join(REACTIONS)}. Реакция встанет на последнюю реплику (#{message_id}). "
+        "Чтобы поставить её на другое сообщение, допиши его номер из истории: REACT 👍 #123. "
+        "Номер — у сообщения в квадратных скобках; смотри, кто его автор. "
+        "Ставь, когда сообщение правда смешное, точное или тёплое, или когда тебя об этом просят, "
+        "а не на каждое. Если реакции хватит и словами отвечать не нужно — после строки REACT напиши SKIP."
+    )
 
 
-def parse_reaction(text: str) -> tuple[str | None, str]:
-    """«REACT 😁\nтекст» → ("😁", "текст"). Смайлик не из REACTIONS отбрасывается."""
+_REACT_RE = re.compile(r"^\s*REACT:?[ \t]*([^\s#]+)(?:[ \t]*#(\d+))?[ \t]*\n?", re.IGNORECASE)
+
+
+def parse_reaction(text: str) -> tuple[str | None, int | None, str]:
+    """«REACT 😁 #12\nтекст» → ("😁", 12, "текст"). Смайлик не из REACTIONS отбрасывается."""
     m = _REACT_RE.match(text)
     if not m:
-        return None, text
+        return None, None, text
     emoji = m.group(1).replace("\ufe0f", "")
-    return (emoji if emoji in REACTIONS else None), text[m.end():].strip()
+    target = int(m.group(2)) if m.group(2) else None
+    return (emoji if emoji in REACTIONS else None), target, text[m.end():].strip()
 
 
 _last_react_check: dict[int, float] = {}
@@ -1085,7 +1093,7 @@ def reply_block(message, seen: set[int] = frozenset()) -> str:
         body = f"[{mark}] {body}".strip()
     body = body or "[без текста]"
     links = [u for u in hidden_links(r) if u not in body]
-    return "\n".join([f"[В ответ на сообщение {who}]: {body}", *links])
+    return "\n".join([f"[В ответ на сообщение #{r.message_id} {who}]: {body}", *links])
 
 
 async def _process_message(message: types.Message, *, private: bool = False):
@@ -1129,7 +1137,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # Берём только предыдущие реплики этого чата. Текущую добавляем после
     # снимка, чтобы LLM не увидела её дважды и чтобы разные чаты не смешивались.
     context_messages = channel_context.get_recent(chat_id, 30)
-    channel_context.add(chat_id, text, sender)
+    channel_context.add(chat_id, text, sender, message_id=message.message_id)
     links = hidden_links(message)
     if not private:
         chat_archive.remember_username(chat_id, message.chat.username)
@@ -1213,7 +1221,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
     else:
         is_news = False
 
-    hints.append(REACTION_HINT)
+    hints.append(reaction_hint(message.message_id))
 
     # Слабый триггер или кулдаун: для новости остаётся только проверка на дубль,
     # для шутки — только реакция
@@ -1260,7 +1268,7 @@ async def _process_message(message: types.Message, *, private: bool = False):
         logger.error(f"[LLM ERROR] {e}")
         return
 
-    reaction, response = parse_reaction(response)
+    reaction, react_to, response = parse_reaction(response)
     # Текст не отправляем: пустой, SKIP, режим «только реакция»
     # или слишком короткий ответ на слабый триггер
     say = bool(response.strip()) and not response.strip().upper().startswith("SKIP") and not react_only
@@ -1278,8 +1286,9 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     if reaction:
         try:
-            await bot.set_message_reaction(chat_id, message.message_id, [ReactionTypeEmoji(emoji=reaction)])
-            logger.info(f"[REACT] {reaction} на сообщение {sender}")
+            target = react_to or message.message_id
+            await bot.set_message_reaction(chat_id, target, [ReactionTypeEmoji(emoji=reaction)])
+            logger.info(f"[REACT] {reaction} на сообщение #{target}" + ("" if react_to else f" от {sender}"))
         except Exception as e:
             logger.warning(f"[REACT ERROR] {reaction}: {e}")
     if not say:
@@ -1288,7 +1297,8 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # Отправляем
     try:
         sent = await send_formatted(chat_id, response, reply_to=message)
-        channel_context.add(chat_id, response, BOT_LABEL, is_bot=True)
+        channel_context.add(chat_id, response, BOT_LABEL, is_bot=True,
+                            message_id=sent.message_id if sent else None)
         archive_bot_message(chat_id, sent, response)
         rate_limiter.record_response(chat_id, user_id, cooldown=not direct)
         if direct:
@@ -1343,7 +1353,8 @@ async def _proactive_post(chat_id: int) -> None:
         return
     try:
         sent = await send_formatted(chat_id, post)
-        channel_context.add(chat_id, post, BOT_LABEL, is_bot=True)
+        channel_context.add(chat_id, post, BOT_LABEL, is_bot=True,
+                            message_id=sent.message_id if sent else None)
         archive_bot_message(chat_id, sent, post)
     except Exception as e:
         logger.error(f"[PROACTIVE SEND ERROR] chat_id={chat_id}: {e}")
