@@ -147,7 +147,7 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
 # Реакции, которые бот может ставить (из стандартного набора Telegram)
-REACTIONS = os.getenv("REACTIONS", "👍 ❤ 🔥 😁 🤣 👏 🤔 🤯 💯 👌 🤝 🗿 🙈 😢 🎉 🏆").split()
+REACTIONS = os.getenv("REACTIONS", "👍 ❤ 🔥 😁 🤣 👏 🤔 🤯 💯 👌 🤝 🗿 🙈 😢 🎉 🏆 😈 👀").split()
 # Шутку без повода для ответа бот проверяет «на лайк» не чаще раза в REACT_CHECK_MINUTES в чате
 REACT_CHECK_MINUTES = float(os.getenv("REACT_CHECK_MINUTES", "10"))
 # После генерации бот ждёт RESPONSE_DELAY_MIN..MAX секунд: мгновенный ответ выдаёт бота
