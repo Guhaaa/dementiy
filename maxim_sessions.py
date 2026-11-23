@@ -41,7 +41,7 @@ def build_turn(
     parts.append(f"[Последняя реплика, на которую нужно ответить]: {user_message}")
     if hints.strip():
         parts.append(hints.strip())
-    parts.append("Ответь одной репликой или верни SKIP. Команды запускай, только когда нужен поиск в archive.jsonl.")
+    parts.append("Ответь одной репликой или верни SKIP. Без извинений, оправданий и пересказа, как ты искал. Команды запускай, только когда нужен поиск в archive.jsonl.")
     return "\n\n".join(parts)
 
 
