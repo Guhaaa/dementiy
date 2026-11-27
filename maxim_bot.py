@@ -776,8 +776,29 @@ chat_archive = ChatArchive(DATA_DIR)
 wiki = Wiki(DATA_DIR, WIKI_DAILY_SINCE)
 
 
+def neighbors_hint(chat_id: int) -> str:
+    """Соседние группы: человек читает все чаты, в которых состоит."""
+    chats_dir = os.path.join(DATA_DIR, "chats")
+    lines = []
+    for name in sorted(os.listdir(chats_dir)) if os.path.isdir(chats_dir) else []:
+        try:
+            other = int(name)
+        except ValueError:
+            continue
+        if other < 0 and other != chat_id and os.path.exists(path := chat_archive.path(other)):
+            lines.append(f"- «{wiki.title(other)}»: {os.path.abspath(path)}")
+    if not lines:
+        return ""
+    return (
+        "Ты состоишь и в других чатах и можешь читать их переписку. Архивы сообщений "
+        "(по сообщению в строке, новые — в конце файла; свежее смотри через tail):\n"
+        + "\n".join(lines) + "\nЧитай по своему усмотрению."
+    )
+
+
 def memory_hint(chat_id: int) -> str:
-    return wiki.hint(chat_id, lambda c: os.path.abspath(chat_archive.path(c)))
+    """Вики и соседние чаты."""
+    return "\n\n".join(filter(None, [wiki.hint(), neighbors_hint(chat_id)]))
 
 
 def archive_hint(chat_id: int) -> str:

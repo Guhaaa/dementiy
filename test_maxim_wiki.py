@@ -64,14 +64,10 @@ class WikiTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(self.wiki.lint_if_due("2026-11-12", agent)))
         self.assertIsNotNone(asyncio.run(self.wiki.lint_if_due("2026-11-17", agent)))
 
-    def test_hint_points_to_wiki_and_other_archives(self):
-        self.assertEqual(self.wiki.hint(-100, str), "")
+    def test_hint_points_to_wiki(self):
+        self.assertEqual(self.wiki.hint(), "")
         open(self.wiki.index_path, "w").write("x")
-        self.wiki.set_title(-200, "Баня")
-        hint = self.wiki.hint(-100, lambda c: self.wiki.index_path if c == -200 else "/none")
-        self.assertIn("Пользуйся по своему усмотрению", hint)
-        self.assertIn("«Баня»", hint)
-        self.assertNotIn("«ИИ»", hint)
+        self.assertIn("Пользуйся по своему усмотрению", self.wiki.hint())
 
     def test_long_day_is_shrunk(self):
         many = [rec(i, "2026-11-09T10:00:00", text="x" * 2000) for i in range(200)]

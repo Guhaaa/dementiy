@@ -240,19 +240,12 @@ class Wiki:
         self._save()
         return answer
 
-    def hint(self, chat_id: int, archive_path: Callable[[int], str]) -> str:
-        """Где вики и архивы других чатов; пусто, пока вики нет."""
+    def hint(self) -> str:
+        """Где вики; пусто, пока вики нет."""
         if not os.path.exists(self.index_path):
             return ""
-        archives = [
-            f"- «{self.title(int(c))}»: {archive_path(int(c))}"
-            for c in sorted(self.titles) if int(c) != chat_id and os.path.exists(archive_path(int(c)))
-        ]
-        text = (
+        return (
             f"У тебя есть вики {self.root}: там описано всё, что с тобой происходило в чатах, — "
             "люди (people/<id>.md по Telegram id), чаты, темы и ты сам (self.md); каталог — index.md. "
             "Пользуйся по своему усмотрению. Файлы не меняй."
         )
-        if archives:
-            text += "\nАрхивы сообщений других чатов:\n" + "\n".join(archives)
-        return text

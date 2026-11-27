@@ -135,6 +135,22 @@ class ReactionTests(unittest.TestCase):
         self.assertTrue(maxim_bot.react_check_ok(-2))
 
 
+class NeighborsHintTests(unittest.TestCase):
+    def test_lists_other_group_archives_only(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            for c in (-100, -200, 555):
+                os.makedirs(os.path.join(tmp, "chats", str(c)))
+                open(os.path.join(tmp, "chats", str(c), "archive.jsonl"), "w").close()
+            with mock.patch.object(maxim_bot, "DATA_DIR", tmp), \
+                 mock.patch.object(maxim_bot, "chat_archive", maxim_bot.ChatArchive(tmp)), \
+                 mock.patch.dict(maxim_bot.wiki.titles, {"-200": "Баня"}):
+                hint = maxim_bot.neighbors_hint(-100)
+        self.assertIn("«Баня»:", hint)
+        self.assertNotIn("/-100/", hint)
+        self.assertNotIn("/555/", hint)
+
+
 class DeletedMessagesTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_distinguishes_deleted_and_existing(self):
         from aiogram.exceptions import TelegramBadRequest
