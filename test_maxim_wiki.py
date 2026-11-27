@@ -68,6 +68,10 @@ class WikiTests(unittest.TestCase):
         self.assertEqual(self.wiki.hint(), "")
         open(self.wiki.index_path, "w").write("x")
         self.assertIn("Пользуйся по своему усмотрению", self.wiki.hint())
+        self.assertNotIn("Этот чат", self.wiki.hint(-100))
+        os.makedirs(os.path.join(self.wiki.root, "chats"), exist_ok=True)
+        open(os.path.join(self.wiki.root, "chats", "-100.md"), "w").write("x")
+        self.assertIn("Этот чат описан в chats/-100.md.", self.wiki.hint(-100))
 
     def test_long_day_is_shrunk(self):
         many = [rec(i, "2026-11-09T10:00:00", text="x" * 2000) for i in range(200)]

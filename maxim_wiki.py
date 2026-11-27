@@ -241,12 +241,17 @@ class Wiki:
         self._save()
         return answer
 
-    def hint(self) -> str:
-        """Где вики; пусто, пока вики нет."""
+    def hint(self, chat_id: int | None = None) -> str:
+        """Где вики и страница текущего чата; пусто, пока вики нет."""
         if not os.path.exists(self.index_path):
             return ""
+        page = f"chats/{chat_id}.md"
+        here = (
+            f" Этот чат описан в {page}."
+            if chat_id is not None and os.path.exists(os.path.join(self.root, page)) else ""
+        )
         return (
             f"У тебя есть вики {self.root}: там описано всё, что с тобой происходило в чатах, — "
-            "люди (people/<id>.md по Telegram id), чаты, темы и ты сам (self.md); каталог — index.md. "
-            "Пользуйся по своему усмотрению. Файлы не меняй."
+            "люди (people/<id>.md по Telegram id), чаты, темы и ты сам (self.md); каталог — index.md."
+            f"{here} Пользуйся по своему усмотрению. Файлы не меняй."
         )

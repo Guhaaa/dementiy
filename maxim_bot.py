@@ -798,7 +798,7 @@ def neighbors_hint(chat_id: int) -> str:
 
 def memory_hint(chat_id: int) -> str:
     """Вики и соседние чаты."""
-    return "\n\n".join(filter(None, [wiki.hint(), neighbors_hint(chat_id)]))
+    return "\n\n".join(filter(None, [wiki.hint(chat_id), neighbors_hint(chat_id)]))
 
 
 def archive_hint(chat_id: int) -> str:
