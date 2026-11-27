@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_archive import ChatArchive, record
-from maxim_memory import Memory
+from maxim_wiki import Wiki
 from maxim_overrides import EXTRACT_PROMPT, Correction, Overrides, PendingCorrections, parse_correction
 from maxim_format import md_to_telegram_html
 from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
@@ -147,10 +147,13 @@ PROACTIVE_TOPICS: dict[int, str] = {
 DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
-# Общая память по группам (maxim_memory): с какого дня брать архив и в котором часу
-# (PROACTIVE_TZ) каждую ночь дописывать прошедший день
-MEMORY_SINCE = os.getenv("MEMORY_SINCE", "2026-11-04")
-MEMORY_HOUR = int(os.getenv("MEMORY_HOUR", "4"))
+# Вики о чатах (maxim_wiki): история до WIKI_DAILY_SINCE идёт одной пачкой, дальше по дням;
+# каждую ночь в WIKI_HOUR (PROACTIVE_TZ) дописывается прошедший день
+WIKI_DAILY_SINCE = os.getenv("WIKI_DAILY_SINCE", "2026-11-04")
+WIKI_HOUR = int(os.getenv("WIKI_HOUR", "4"))
+# Агенту на пачку: на всю старую историю — дольше
+WIKI_TIMEOUT = float(os.getenv("WIKI_TIMEOUT", "1800"))
+WIKI_HISTORY_TIMEOUT = float(os.getenv("WIKI_HISTORY_TIMEOUT", "10800"))
 # Реакции, которые бот может ставить (из стандартного набора Telegram)
 REACTIONS = os.getenv("REACTIONS", "👍 ❤ 🔥 😁 🤣 👏 🤔 🤯 💯 👌 🤝 🗿 🙈 😢 🎉 🏆 😈 👀").split()
 # Шутку без повода для ответа бот проверяет «на лайк» не чаще раза в REACT_CHECK_MINUTES в чате
@@ -493,18 +496,20 @@ class MaximResponseEngine:
         session: bool = False,
         resume: str | None = None,
         images: list[str] | None = None,
+        sandbox: str | None = None,
+        timeout: float | None = None,
     ) -> tuple[str, str | None]:
         """`codex exec` в каталоге workdir, в песочнице CODEX_SANDBOX.
 
         session=True — сессия сохраняется; без resume начинается новая,
         и вторым значением возвращается её thread_id.
         """
-        timeout = max(CODEX_TIMEOUT, 300) if web_search else CODEX_TIMEOUT
+        timeout = timeout or (max(CODEX_TIMEOUT, 300) if web_search else CODEX_TIMEOUT)
         out_fd, out_file = tempfile.mkstemp(prefix="maxim-answer-", suffix=".txt")
         os.close(out_fd)
         args = [
             CODEX_BIN, "exec",
-            "--skip-git-repo-check", "--sandbox", CODEX_SANDBOX, "--color", "never",
+            "--skip-git-repo-check", "--sandbox", sandbox or CODEX_SANDBOX, "--color", "never",
             "-C", workdir, "-o", out_file,
             "-c", f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
             "-c", f'web_search="{"live" if web_search else "disabled"}"',
@@ -768,11 +773,11 @@ dp = Dispatcher()
 rate_limiter = RateLimiter()
 overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
 chat_archive = ChatArchive(DATA_DIR)
-memory = Memory(DATA_DIR, MEMORY_SINCE)
+wiki = Wiki(DATA_DIR, WIKI_DAILY_SINCE)
 
 
 def memory_hint(chat_id: int) -> str:
-    return memory.hint(chat_id, lambda c: os.path.abspath(chat_archive.path(c)))
+    return wiki.hint(chat_id, lambda c: os.path.abspath(chat_archive.path(c)))
 
 
 def archive_hint(chat_id: int) -> str:
@@ -1398,11 +1403,12 @@ async def proactive_loop() -> None:
         await asyncio.sleep(min(max(wait, 5), 600))
 
 
-async def update_memory() -> None:
-    """Дописывает память по всем группам за прошедшие дни, потом общий слой."""
+async def update_wiki() -> None:
+    """Вносит в вики необработанные пачки всех групп по порядку дат, потом чистка раз в неделю."""
     today = datetime.now(timezone.utc).date().isoformat()
     chats_dir = os.path.join(DATA_DIR, "chats")
-    changed = 0
+    wiki.prepare()
+    chats = {}
     for name in sorted(os.listdir(chats_dir)) if os.path.isdir(chats_dir) else []:
         try:
             chat_id = int(name)
@@ -1411,32 +1417,43 @@ async def update_memory() -> None:
         if chat_id > 0 or not os.path.exists(chat_archive.path(chat_id)):
             continue
         try:
-            memory.set_title(chat_id, (await bot.get_chat(chat_id)).title or "")
+            wiki.set_title(chat_id, (await bot.get_chat(chat_id)).title or "")
         except Exception as e:
-            logger.warning(f"[MEMORY] нет названия чата {chat_id}: {e}")
+            logger.warning(f"[WIKI] нет названия чата {chat_id}: {e}")
+        chats[chat_id] = chat_archive.records(chat_id)
+
+    for key, chat_id, records in wiki.pending(chats, today):
+        timeout = WIKI_HISTORY_TIMEOUT if key == "0000-history" else WIKI_TIMEOUT
+
+        async def agent(prompt: str, workdir: str, timeout=timeout) -> str:
+            text, _ = await response_engine._codex_run(
+                prompt, workdir, sandbox="workspace-write", timeout=timeout)
+            return text
+        logger.info(f"[WIKI] chat_id={chat_id} {key}: {len(records)} сообщений")
         try:
-            days = await memory.update_chat(chat_id, chat_archive.records(chat_id), today,
-                                            response_engine._codex_exec)
+            answer = await wiki.ingest(chat_id, key, records, agent)
         except Exception as e:
-            logger.error(f"[MEMORY ERROR] chat_id={chat_id}: {e}")
-            continue
-        if days:
-            logger.info(f"[MEMORY] chat_id={chat_id}: обработано дней {days}")
-        changed += days
-    if changed or not os.path.exists(memory.self_path):
-        try:
-            await memory.update_self(response_engine._codex_exec)
-            logger.info("[MEMORY] общая память обновлена")
-        except Exception as e:
-            logger.error(f"[MEMORY ERROR] общий слой: {e}")
+            logger.error(f"[WIKI ERROR] chat_id={chat_id} {key}: {e}")
+            return  # следующая попытка — в следующий запуск, с той же пачки
+        logger.info(f"[WIKI] chat_id={chat_id} {key}: {answer[:200]!r}")
+
+    async def lint_agent(prompt: str, workdir: str) -> str:
+        text, _ = await response_engine._codex_run(
+            prompt, workdir, sandbox="workspace-write", timeout=WIKI_TIMEOUT)
+        return text
+    try:
+        if answer := await wiki.lint_if_due(today, lint_agent):
+            logger.info(f"[WIKI] чистка: {answer[:200]!r}")
+    except Exception as e:
+        logger.error(f"[WIKI ERROR] чистка: {e}")
 
 
-async def memory_loop() -> None:
-    """При запуске догоняет пропущенные дни, дальше — каждую ночь в MEMORY_HOUR."""
+async def wiki_loop() -> None:
+    """При запуске догоняет пропущенное, дальше — каждую ночь в WIKI_HOUR."""
     while True:
-        await update_memory()
+        await update_wiki()
         now = datetime.now(PROACTIVE_TZ)
-        run = now.replace(hour=MEMORY_HOUR, minute=0, second=0, microsecond=0)
+        run = now.replace(hour=WIKI_HOUR, minute=0, second=0, microsecond=0)
         if run <= now:
             run += timedelta(days=1)
         await asyncio.sleep((run - now).total_seconds())
@@ -1475,7 +1492,7 @@ async def main():
     if ARCHIVE_SWEEP_MINUTES > 0:
         asyncio.create_task(archive_sweep_loop())
     if LLM_PROVIDER == "codex":
-        asyncio.create_task(memory_loop())
+        asyncio.create_task(wiki_loop())
     if PROACTIVE_ENABLED and LLM_PROVIDER == "codex":
         asyncio.create_task(proactive_loop())
     elif PROACTIVE_ENABLED:
