@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 from maxim_archive import ChatArchive, record
+from maxim_memory import Memory
 from maxim_overrides import EXTRACT_PROMPT, Correction, Overrides, PendingCorrections, parse_correction
 from maxim_format import md_to_telegram_html
 from maxim_proactive import ProactiveState, build_task, clean_post, next_post_time
@@ -146,6 +147,10 @@ PROACTIVE_TOPICS: dict[int, str] = {
 DATA_DIR = os.getenv("DATA_DIR", "data")
 # Картинки из сообщений передаются Codex (--image)
 CODEX_IMAGES = os.getenv("CODEX_IMAGES", "1") == "1"
+# Общая память по группам (maxim_memory): с какого дня брать архив и в котором часу
+# (PROACTIVE_TZ) каждую ночь дописывать прошедший день
+MEMORY_SINCE = os.getenv("MEMORY_SINCE", "2026-11-04")
+MEMORY_HOUR = int(os.getenv("MEMORY_HOUR", "4"))
 # Реакции, которые бот может ставить (из стандартного набора Telegram)
 REACTIONS = os.getenv("REACTIONS", "👍 ❤ 🔥 😁 🤣 👏 🤔 🤯 💯 👌 🤝 🗿 🙈 😢 🎉 🏆 😈 👀").split()
 # Шутку без повода для ответа бот проверяет «на лайк» не чаще раза в REACT_CHECK_MINUTES в чате
@@ -616,6 +621,7 @@ class MaximResponseEngine:
             chat_id, None, channel_context.get_recent(chat_id, 30), "",
             task="\n\n".join(filter(None, [
                 build_task(recent, PROACTIVE_TOPICS.get(chat_id, "")), archive_hint(chat_id),
+                memory_hint(chat_id),
             ])),
             web_search=True,
         )
@@ -684,6 +690,8 @@ class MaximResponseEngine:
             hints += f"\n\n{extra_hint}"
         if chat_id is not None and (archived := archive_hint(chat_id)):
             hints += f"\n\n{archived}"
+        if chat_id is not None and (remembered := memory_hint(chat_id)):
+            hints += f"\n\n{remembered}"
         if web_search:
             hints += "\n\nВ реплике есть ссылка. Если для ответа нужно её содержимое — открой её."
         if LLM_PROVIDER == "codex" and chat_id is not None:
@@ -759,6 +767,11 @@ dp = Dispatcher()
 rate_limiter = RateLimiter()
 overrides = Overrides(os.path.join(DATA_DIR, "overrides.json"))
 chat_archive = ChatArchive(DATA_DIR)
+memory = Memory(DATA_DIR, MEMORY_SINCE)
+
+
+def memory_hint(chat_id: int) -> str:
+    return memory.hint(chat_id, lambda c: os.path.abspath(chat_archive.path(c)))
 
 
 def archive_hint(chat_id: int) -> str:
@@ -1380,6 +1393,50 @@ async def proactive_loop() -> None:
         await asyncio.sleep(min(max(wait, 5), 600))
 
 
+async def update_memory() -> None:
+    """Дописывает память по всем группам за прошедшие дни, потом общий слой."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    chats_dir = os.path.join(DATA_DIR, "chats")
+    changed = 0
+    for name in sorted(os.listdir(chats_dir)) if os.path.isdir(chats_dir) else []:
+        try:
+            chat_id = int(name)
+        except ValueError:
+            continue
+        if chat_id > 0 or not os.path.exists(chat_archive.path(chat_id)):
+            continue
+        try:
+            memory.set_title(chat_id, (await bot.get_chat(chat_id)).title or "")
+        except Exception as e:
+            logger.warning(f"[MEMORY] нет названия чата {chat_id}: {e}")
+        try:
+            days = await memory.update_chat(chat_id, chat_archive.records(chat_id), today,
+                                            response_engine._codex_exec)
+        except Exception as e:
+            logger.error(f"[MEMORY ERROR] chat_id={chat_id}: {e}")
+            continue
+        if days:
+            logger.info(f"[MEMORY] chat_id={chat_id}: обработано дней {days}")
+        changed += days
+    if changed or not os.path.exists(memory.self_path):
+        try:
+            await memory.update_self(response_engine._codex_exec)
+            logger.info("[MEMORY] общая память обновлена")
+        except Exception as e:
+            logger.error(f"[MEMORY ERROR] общий слой: {e}")
+
+
+async def memory_loop() -> None:
+    """При запуске догоняет пропущенные дни, дальше — каждую ночь в MEMORY_HOUR."""
+    while True:
+        await update_memory()
+        now = datetime.now(PROACTIVE_TZ)
+        run = now.replace(hour=MEMORY_HOUR, minute=0, second=0, microsecond=0)
+        if run <= now:
+            run += timedelta(days=1)
+        await asyncio.sleep((run - now).total_seconds())
+
+
 async def archive_sweep_loop() -> None:
     """Bot API не сообщает об удалённых сообщениях: проверяем свежие сами."""
     chats_dir = os.path.join(DATA_DIR, "chats")
@@ -1412,6 +1469,8 @@ async def main():
     logger.info(f"🤖 Бот запущен: ID={BOT_ID}, @{BOT_USERNAME}")
     if ARCHIVE_SWEEP_MINUTES > 0:
         asyncio.create_task(archive_sweep_loop())
+    if LLM_PROVIDER == "codex":
+        asyncio.create_task(memory_loop())
     if PROACTIVE_ENABLED and LLM_PROVIDER == "codex":
         asyncio.create_task(proactive_loop())
     elif PROACTIVE_ENABLED:

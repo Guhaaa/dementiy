@@ -96,6 +96,9 @@ class ChatArchive:
         except FileNotFoundError:
             return []
 
+    def records(self, chat_id: int) -> list[dict]:
+        return self._read(chat_id)
+
     def recent_ids(self, chat_id: int, since: str) -> list[int]:
         """id сообщений с датой не раньше since (ISO в UTC, как в архиве)."""
         return [m["id"] for m in self._read(chat_id) if m["date"] >= since]
