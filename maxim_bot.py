@@ -722,10 +722,11 @@ class ChannelContext:
         return sum(len(messages) for messages in self.messages_by_chat.values())
 
     def add(self, chat_id: int, text: str, sender: str, *, is_bot: bool = False,
-            message_id: int | None = None):
+            message_id: int | None = None, user_id: int | None = None):
         message = {
             "chat_id": chat_id,
             "id": message_id,
+            "uid": user_id or None,
             "text": text,
             "from": BOT_LABEL if is_bot else sender,
             "date": datetime.now().isoformat(),
@@ -943,7 +944,7 @@ def archive_bot_message(chat_id: int, sent, text: str) -> None:
         return
     chat_archive.append(chat_id, record(
         sent.message_id, sent.date.isoformat(), BOT_LABEL, text, None,
-        sent.reply_to_message.message_id if sent.reply_to_message else None,
+        sent.reply_to_message.message_id if sent.reply_to_message else None, uid=BOT_ID,
     ))
 
 
@@ -1100,6 +1101,8 @@ def reply_block(message, seen: set[int] = frozenset()) -> str:
         who = BOT_LABEL
     else:
         who = r.author_signature or (r.from_user.full_name if r.from_user else "Unknown")
+        if r.from_user and not r.author_signature:
+            who += f" (id {r.from_user.id})"
     quote = message.quote.text if message.quote else ""
     body = (quote or r.text or r.caption or "")[:1500]
     if mark := media_mark(r, seen):
@@ -1150,14 +1153,14 @@ async def _process_message(message: types.Message, *, private: bool = False):
     # Берём только предыдущие реплики этого чата. Текущую добавляем после
     # снимка, чтобы LLM не увидела её дважды и чтобы разные чаты не смешивались.
     context_messages = channel_context.get_recent(chat_id, 30)
-    channel_context.add(chat_id, text, sender, message_id=message.message_id)
+    channel_context.add(chat_id, text, sender, message_id=message.message_id, user_id=user_id)
     links = hidden_links(message)
     if not private:
         chat_archive.remember_username(chat_id, message.chat.username)
         chat_archive.append(chat_id, record(
             message.message_id, message.date.isoformat(), sender, text, links,
             message.reply_to_message.message_id if message.reply_to_message else None,
-            media_kind(message),
+            media_kind(message), user_id or None,
         ))
 
     # Проверяем, ответил ли кто-то на сообщение бота
@@ -1182,6 +1185,8 @@ async def _process_message(message: types.Message, *, private: bool = False):
 
     # Модели нужен и текст реплая, и ссылки, спрятанные под текстом
     llm_text = "\n".join([text, *(u for u in links if u not in text)]).strip()
+    # Автор реплики: модель должна знать, кто пишет; человека узнаёт по id
+    llm_text = f"[Автор: {sender}{f' (id {user_id})' if user_id else ''}] {llm_text}"
     if mark := media_mark(message, seen):
         llm_text = f"[к сообщению приложено: {mark}]\n{llm_text}"
     if quoted := reply_block(message, seen):

@@ -27,7 +27,10 @@ MAX_DAY_CHARS = 60_000
 WHO = (
     "Ты — бот, который в групповых чатах играет Максима Дементьева. "
     "В истории твои сообщения подписаны «Бот (ты)». «Максим Дементьев» — настоящий Максим, "
-    "его слова о себе — факты о том, кого ты играешь."
+    "его слова о себе — факты о том, кого ты играешь. "
+    "Человека узнавай по id: одного и того же человека в разных чатах и в разное время "
+    "могут подписывать по-разному (например, по-русски и латиницей). "
+    "В заметках и памяти пиши имя и id: «Женя Бабаев (id 423275555)»."
 )
 
 DAY_PROMPT = WHO + """
@@ -92,7 +95,8 @@ def format_day(records: list[dict]) -> str:
         for r in records:
             reply = f" ↩{r['reply_to']}" if r.get("reply_to") else ""
             media = f"[{r['media']}] " if r.get("media") else ""
-            out.append(f"[{r['date'][11:16]} #{r['id']} {r['from']}{reply}]: {media}{r['text'][:limit]}")
+            uid = f" (id {r['uid']})" if r.get("uid") else ""
+            out.append(f"[{r['date'][11:16]} #{r['id']} {r['from']}{uid}{reply}]: {media}{r['text'][:limit]}")
         return out
     for limit in (800, 400, 200, 100):
         text = "\n".join(lines(limit))

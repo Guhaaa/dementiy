@@ -22,8 +22,8 @@ if [ "$sid" ]; then echo "resumed $sid" > "$out"; else echo "new" > "$out"; fi
 
 class BuildTurnTests(unittest.TestCase):
     def test_history_lines_carry_message_ids(self):
-        turn = build_turn([{"id": 42, "from": "Максим", "text": "привет"}, {"from": "Б", "text": "x"}], "ok")
-        self.assertIn("[#42 Максим]: привет", turn)
+        turn = build_turn([{"id": 42, "from": "Максим", "uid": 7, "text": "привет"}, {"from": "Б", "text": "x"}], "ok")
+        self.assertIn("[#42 Максим (id 7)]: привет", turn)
         self.assertIn("[Б]: x", turn)
 
     def test_turn_contains_new_messages_and_last_reply(self):

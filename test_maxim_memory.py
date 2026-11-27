@@ -13,7 +13,7 @@ def rec(i, date, who="Женя", text="привет", **kw):
 RECORDS = [
     rec(1, "2026-11-03T10:00:00", text="до запуска"),
     rec(2, "2026-11-09T10:00:00+00:00", text="про баню"),
-    rec(3, "2026-11-09T11:00:00+00:00", who="Бот (ты)", text="схожу", reply_to=2),
+    rec(3, "2026-11-09T11:00:00+00:00", who="Бот (ты)", text="схожу", reply_to=2, uid=9),
     rec(4, "2026-11-10T09:00:00+00:00", text="пусто"),
     rec(5, "2026-11-11T09:00:00+00:00", text="сегодня"),
 ]
@@ -47,7 +47,7 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.memory.days_dir(-100), "2026-11-10.md")))
         with open(self.memory.profile_path(-100), encoding="utf-8") as f:
             self.assertEqual(f.read().strip(), "Женя: любит баню.")
-        self.assertIn("#3 Бот (ты) ↩2]: схожу", ask.prompts[0])
+        self.assertIn("#3 Бот (ты) (id 9) ↩2]: схожу", ask.prompts[0])
         again = Memory(self.tmp.name, "2026-11-04")  # состояние переживает перезапуск
         self.assertEqual(again.pending_days(-100, RECORDS, "2026-11-12").keys(), {"2026-11-11"})
 

@@ -32,7 +32,9 @@ def build_turn(
         parts.append(overrides_section.strip() + "\n(Это обновлённые поправки, они заменяют прежние.)")
     if new_messages:
         lines = "\n".join(
-            f"[{'#' + str(m['id']) + ' ' if m.get('id') else ''}{m['from']}]: {m['text']}" for m in new_messages
+            f"[{'#' + str(m['id']) + ' ' if m.get('id') else ''}{m['from']}"
+            f"{' (id ' + str(m['uid']) + ')' if m.get('uid') else ''}]: {m['text']}"
+            for m in new_messages
         )
         parts.append(f"Новые сообщения в чате с прошлого хода:\n{lines}")
     if task:

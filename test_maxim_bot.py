@@ -68,7 +68,7 @@ class ReplyBlockTests(unittest.TestCase):
         original = _msg(message_id=5, text="9 моделей мышления", entities=[link],
                         from_user=SimpleNamespace(id=7, full_name="Roman"))
         block = maxim_bot.reply_block(_msg(text="посмотри", reply_to_message=original))
-        self.assertIn("[В ответ на сообщение #5 Roman]: 9 моделей мышления", block)
+        self.assertIn("[В ответ на сообщение #5 Roman (id 7)]: 9 моделей мышления", block)
         self.assertIn("https://smart-lab.ru/x", block)
 
     def test_selected_quote_wins_and_topic_root_is_ignored(self):

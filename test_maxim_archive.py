@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from maxim_archive import ChatArchive, flatten_export_text, message_link_base, record
+from maxim_archive import ChatArchive, flatten_export_text, message_link_base, record, uids_from_logs
 
 EXPORT = {
     "id": 2497337650,
@@ -12,7 +12,7 @@ EXPORT = {
         {"id": 2, "type": "message", "date": "2026-10-28T11:18:43", "from": "Guha",
          "text": ["Агентам нужен ", {"type": "text_link", "text": "сон", "href": "https://arxiv.org/abs/1"}],
          "reply_to_message_id": 1},
-        {"id": 1, "type": "message", "date": "2026-10-28T11:00:00", "from": "Max", "text": "привет",
+        {"id": 1, "type": "message", "date": "2026-10-28T11:00:00", "from": "Max", "from_id": "user195730395", "text": "привет",
          "photo": "(File not included.)"},
         {"id": 3, "type": "service", "date": "2026-10-28T12:00:00", "text": ""},
         {"id": 4, "type": "message", "date": "2026-10-28T12:00:00", "from": "Dima", "text": ""},
@@ -43,6 +43,8 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.lines(chat_id)[1]["links"], ["https://arxiv.org/abs/1"])
         self.assertEqual(self.lines(chat_id)[1]["reply_to"], 1)
         self.assertEqual(self.lines(chat_id)[0]["media"], "фото")
+        self.assertEqual(self.lines(chat_id)[0]["uid"], 195730395)
+        self.assertNotIn("uid", self.lines(chat_id)[1])
         self.assertNotIn("media", self.lines(chat_id)[1])
         self.assertEqual(self.archive.import_export(EXPORT)[1], 0)
 
@@ -54,6 +56,19 @@ class ArchiveTests(unittest.TestCase):
         fresh = ChatArchive(self.tmp.name)  # username переживает перезапуск
         self.assertEqual(fresh.link_base(-1002497337650), "https://t.me/share_your_prompt")
         self.assertEqual(message_link_base(-100555, None), "https://t.me/c/555")
+
+    def test_fill_uids_by_message_id_then_name(self):
+        self.archive.append(-1001, record(1, "2026-11-09T10:00:00+00:00", "Alex G", "a"))
+        self.archive.append(-1001, record(2, "2026-11-09T10:01:00+00:00", "Женя", "b"))
+        self.archive.append(-1001, record(3, "2026-11-09T10:02:00+00:00", "Кто-то", "c", uid=5))
+        logs = uids_from_logs([
+            "x [MSG] chat=supergroup chat_id=-1001 from=Alex G user_id=237472696 text='hi'",
+            "x [MSG] chat=supergroup chat_id=-1001 from=Канал user_id=0 text='hi'",
+        ])
+        self.assertEqual(logs, {-1001: {"Alex G": 237472696}})
+        self.assertEqual(self.archive.fill_uids(-1001, {2: 423275555}, logs[-1001]), 2)
+        self.assertEqual([m.get("uid") for m in self.lines(-1001)], [237472696, 423275555, 5])
+        self.assertEqual(self.archive.fill_uids(-1001, {}, logs[-1001]), 0)
 
     def test_remove_and_recent_ids(self):
         for i, date in [(1, "2026-11-08T10:00:00+00:00"), (2, "2026-11-09T10:00:00+00:00"),
